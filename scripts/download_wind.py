@@ -58,7 +58,16 @@ WIND_ALIASES = {
     },
     "armstrong": {
         "speed": [("wxtp_sm", 1.0), ("wxts_sm", 1.0)],
+        # wxtp_dm/wxts_dm are relative to the bow, not true/absolute compass
+        # bearings: verified across AR16/AR62/AT46 by comparing direction
+        # stability during heading changes -- wxtp_dm alone shifts almost in
+        # lockstep with heading (regression slope ~-0.7, median |delta| 31-42
+        # deg during >10 deg heading changes), while (wxtp_dm + heading) is
+        # far more stable (median |delta| 8-13 deg), confirming heading is the
+        # correction needed to get true direction. See "direction_reference".
         "direction": [("wxtp_dm", 1.0), ("wxts_dm", 1.0)],
+        "direction_reference": "relative_to_bow",
+        "heading": [("hdt", 1.0)],
         "lat": ["dec_lat"],
         "lon": ["dec_lon"],
     },
@@ -147,6 +156,7 @@ def main() -> None:
             "n_wind_readings": 0,
             "wind_speed_col": None,
             "wind_dir_col": None,
+            "heading_col": None,
             "status": "ok",
             "notes": [],
         }
@@ -186,8 +196,22 @@ def main() -> None:
             cruise_records.append(record)
             continue
 
+        needs_heading = WIND_ALIASES[family].get("direction_reference") == "relative_to_bow"
+        heading = resolve(WIND_ALIASES[family].get("heading", []), headers) if needs_heading else None
+        if needs_heading and not heading:
+            record["status"] = "no_wind_columns"
+            record["notes"].append(
+                f"direction column {direction[0]} is relative to the bow but no heading "
+                f"column was found to correct it to true; excluded to avoid publishing "
+                f"ship-relative angles as absolute direction"
+            )
+            cruise_records.append(record)
+            continue
+
         record["wind_speed_col"] = speed[0]
         record["wind_dir_col"] = direction[0]
+        if heading:
+            record["heading_col"] = heading[0]
 
         per_cruise: list[dict] = []
         n_rows = 0
@@ -200,6 +224,9 @@ def main() -> None:
             if not (0 <= ws < 100):
                 continue
             wd = first_float(row, [direction[0]])
+            if wd is not None and heading is not None:
+                hdg = first_float(row, [heading[0]])
+                wd = (wd + hdg) % 360 if hdg is not None else None
             lat = first_float(row, WIND_ALIASES[family]["lat"])
             lon = first_float(row, WIND_ALIASES[family]["lon"])
             per_cruise.append({
@@ -252,7 +279,8 @@ def main() -> None:
             "mcp": "Columns and endpoints were located via the nes-lter-mcp MCP server "
                    "(tools: find_cruises, query_underway, get_dataset_schema, resolve_variable). "
                    "Vessel->column mapping mirrors that server's UNDERWAY_VARIABLE_ALIASES, except "
-                   "the Endeavor speed conversion factor, which that table has wrong (see note below).",
+                   "two corrections that table does not have: the Endeavor speed conversion factor, "
+                   "and the Armstrong/Atlantis direction-to-heading correction (see notes below).",
         },
         "variables": {
             "wind_speed_m_s": "True wind speed at the bow anemometer, converted to m/s "
@@ -261,25 +289,39 @@ def main() -> None:
                               "true wind vectorially from relative wind + heading + ship speed "
                               "log, since the raw column name carries no unit and the MCP "
                               "server's own alias table assumes m/s incorrectly).",
-            "wind_dir_deg": "True wind direction, degrees from north (0-360).",
+            "wind_dir_deg": "True wind direction, degrees from north (0-360). For Armstrong/"
+                            "Atlantis, wxtp_dm/wxts_dm are relative to the bow (0=dead ahead, "
+                            "clockwise), NOT true direction as their name suggests -- confirmed by "
+                            "comparing direction stability during heading changes across AR16/AR62/"
+                            "AT46 (raw value shifts almost in lockstep with heading, regression "
+                            "slope ~-0.7-0.8; adding heading back in, i.e. (dm + hdt) % 360, cuts "
+                            "the median instability from 31-42 deg to 8-13 deg during turns). The "
+                            "MCP server's alias table has this same gap (uses dm directly with no "
+                            "heading correction). This pipeline now corrects it using the true "
+                            "heading column (hdt); cruises where hdt isn't available are excluded "
+                            "rather than publishing uncorrected relative angles as absolute.",
         },
         "quality": "Rows with NODATA/NAN/missing sentinel values or non-physical speeds "
                    "(<0 or >=100 m/s) are dropped; no other QA applied. Only true wind is used; "
                    "cruises that only have relative wind are excluded (see cruise notes). "
                    "No gust de-spiking — a small number of very large readings remain and are "
                    "visible in the velocity distribution. "
-                   "Armstrong/Atlantis (wxtp_sm/wxts_sm) unit was NOT independently verifiable the "
-                   "way Endeavor's was: the Armstrong underway feed exposes only the vessel's "
-                   "already-computed true wind, with no paired relative-wind + heading columns to "
-                   "reconstruct it from. An NDBC buoy cross-check (44008, near AR16's May 2017 "
-                   "track) was inconclusive -- wind direction disagreed by ~100 deg at the closest "
-                   "approaches, most likely real local/coastal variability rather than a units "
-                   "issue, but it means the comparison couldn't confirm or rule out either unit. "
-                   "The fleet-wide median wind speed of ~7 units is consistent with typical open-"
-                   "ocean climatology in m/s (treating it as knots would imply an unusually calm "
-                   "~3.5 m/s average), so m/s (factor 1.0, unchanged) was kept, but this is a "
-                   "plausibility argument, not proof -- confirming it would need WHOI SSSG's SCS "
-                   "configuration record for Neil Armstrong/Atlantis's WXT weather stations.",
+                   "Armstrong/Atlantis (wxtp_sm/wxts_sm) speed was NOT independently verifiable the "
+                   "way Endeavor's or the direction fix above were: there's no paired true-wind "
+                   "column to reconstruct it from, and now that wxtp_dm is known to be relative-to-"
+                   "bow rather than true, wxtp_sm reported alongside it may likewise be apparent "
+                   "(ship-relative) wind speed rather than true wind speed, on top of the separate "
+                   "open question of whether it's in m/s or knots -- these are two different, "
+                   "compounding uncertainties. An NDBC buoy cross-check (44008, near AR16's May "
+                   "2017 track) was inconclusive for units -- wind direction disagreed by ~100 deg "
+                   "at the closest approaches, most likely real local/coastal variability. A vector "
+                   "apparent-to-true correction test (using hdt + sog) did not clearly show wxtp_sm "
+                   "behaving like apparent wind either (derived 'true' speed was not more stable "
+                   "than raw wxtp_sm during speed changes), so that question is open too. wxtp_sm "
+                   "is left unconverted (treated as true wind speed in m/s) pending a real answer "
+                   "from WHOI SSSG's SCS configuration record for Neil Armstrong/Atlantis's WXT "
+                   "weather stations -- treat Armstrong/Atlantis wind_speed_m_s with more caution "
+                   "than direction, which is now corrected with good evidence.",
         "season_definition": "Cruise start month: winter={12,1,2}, spring={3,4,5}, summer={6,7,8}, fall={9,10,11} "
                              "(same convention as the NES-LTER API / nes-lter-mcp find_cruises tool).",
         "cruises": cruise_records,

@@ -52,7 +52,7 @@ def _(marimo, prov, df):
     | **Source** | NES-LTER API, `https://nes-lter-api.whoi.edu` |
     | **Cruise catalog** | `/api/ctd/cruises/all` |
     | **Underway data** | `/api/underway/{{cruise}}.csv` (one CSV per cruise, stored in `data/raw/`) |
-    | **Variables** | true wind speed at the bow anemometer, converted to m/s (Sharp, Atlantic Explorer, and Endeavor sensors report knots); true wind direction, degrees from north |
+    | **Variables** | true wind speed at the bow anemometer, converted to m/s (Sharp, Atlantic Explorer, and Endeavor sensors report knots); true wind direction, degrees from north (Armstrong/Atlantis direction is corrected from relative-to-bow to true using ship heading — see the note below the wind roses) |
     | **Season** | by cruise start month: winter {{12,1,2}}, spring {{3,4,5}}, summer {{6,7,8}}, fall {{9,10,11}} |
     | **QA** | NODATA/NAN sentinels and non-physical speeds (<0 or ≥100 m/s) dropped. **True wind only** — cruises with only relative wind are excluded (see `cruises.csv` notes). No gust de-spiking, so a few large spikes remain and are visible in the distribution tail. |
     | **Discovery** | endpoints and vessel→column mapping located via the `nes-lter-mcp` MCP server (`find_cruises`, `query_underway`, `get_dataset_schema`, `resolve_variable`), except the Endeavor unit, which that server's `UNDERWAY_VARIABLE_ALIASES` table gets wrong — confirmed in knots by vectorially reconstructing true wind from relative wind + heading + ship speed (median residual 2.4% across 4,428 EN608 rows). Armstrong/Atlantis's unit could not be independently confirmed the same way (no paired relative-wind data) and is left as m/s on climatological plausibility only — see `provenance.json` for both. |
@@ -188,49 +188,154 @@ def _(marimo, pd, hv, d, x, COLORS):
 
 @app.cell
 def _(marimo):
-    marimo.md('### 3. Wind direction by season (wind roses)\n\n30° sectors; bar length is the time-weighted share of readings in each sector, relative to the busiest sector of that season.')
+    marimo.md("""
+    ### 3. Wind direction by season (wind roses)
+
+    Classic wind-rose layout: 16 compass sectors (0°=N, clockwise), petal
+    length = % of time the wind blew from that sector (time-weighted), and
+    each petal is stacked by wind speed bin -- weakest nearest the center,
+    strongest at the tip -- so both prevailing direction and how hard it
+    typically blows from that direction are visible together. The % of time
+    below 1 m/s ("calm", direction undefined at near-zero wind) is shown in
+    the center of each rose rather than assigned to a direction. All four
+    roses share one radial scale and one legend (upper right). Direction is
+    true/absolute (not relative to the ship's heading; see provenance note
+    below the roses).
+    """)
     return
 
 @app.cell
-def _(np, hv, d, SEASON_ORDER, COLORS):
+def _(np, hv):
     # Bokeh (holoviews' backend here) has no native polar coordinate system,
-    # so each rose is built as Cartesian wedge polygons -- one per 30-degree
-    # sector, with radius = the time-weighted share of that sector. Data is
-    # tiny (12 sectors x 4 seasons) so no resampling is needed here.
-    def _wind_rose(counts, color, title):
-        _nsec = len(counts)
-        _edges_deg = np.linspace(0, 360, _nsec + 1)
-        _polys = []
-        for _i in range(_nsec):
-            _c0, _c1 = _edges_deg[_i], _edges_deg[_i + 1]
-            _m0, _m1 = np.radians(90 - _c1), np.radians(90 - _c0)
-            _thetas = np.linspace(_m0, _m1, 6)
-            _r = counts[_i]
-            _xs = np.concatenate([[0], _r * np.cos(_thetas), [0]])
-            _ys = np.concatenate([[0], _r * np.sin(_thetas), [0]])
-            _polys.append({'x': _xs, 'y': _ys, 'pct': _r, 'sector deg': f'{_c0:.0f}-{_c1:.0f}'})
-        _wedges = hv.Polygons(_polys, vdims=['pct', 'sector deg']).opts(color=color, line_color='white', line_width=0.5, alpha=0.85, tools=['hover'])
-        _rings = hv.Path([hv.Ellipse(0, 0, 2 * _rr).array() for _rr in (25, 50, 75, 100)]).opts(color='gray', line_width=0.5, line_dash='dotted')
-        _compass = hv.Labels({'x': [0, 108, 0, -108], 'y': [108, 0, -108, 0], 'text': ['N', 'E', 'S', 'W']}, ['x', 'y'], 'text').opts(text_font_size='9pt', text_color='gray')
-        return (_rings * _wedges * _compass).opts(width=320, height=320, xaxis=None, yaxis=None, show_grid=False, xlim=(-118, 118), ylim=(-118, 118), title=title)
+    # so each rose is built from Cartesian annular-wedge polygons -- one per
+    # 16-sector x speed-bin combination. Data is tiny per rose (16 sectors x
+    # 8 speed bins x 4 seasons) so no resampling is needed here.
+    CALM_THRESHOLD = 1.0  # m/s; shown as a single number in the center of each rose
+    # Bin edges chosen from the data's own distribution (99% of readings fall under
+    # 19 m/s, max ~29 m/s), colored with the blue -> green -> yellow -> orange -> red
+    # -> magenta progression used by windy.com / earth.nullschool-style wind speed
+    # scales, rather than this project's usual single-hue sequential ramp -- a
+    # deliberate exception since matching that specific, widely recognized
+    # convention was requested.
+    SPEED_BINS = [CALM_THRESHOLD, 4, 7, 10, 13, 16, 19, 22, np.inf]
+    SPEED_LABELS = ['1–4', '4–7', '7–10', '10–13', '13–16', '16–19', '19–22', '22+']
+    SPEED_COLORS = {
+        '1–4': '#4a7bd4', '4–7': '#35a6d9', '7–10': '#35c48d', '10–13': '#7fc93c',
+        '13–16': '#f2d43d', '16–19': '#f2a13d', '19–22': '#e8562f', '22+': '#c22b6e',
+    }
+    NSEC = 16
+    COMPASS8 = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
-    nsec = 12
-    edges = np.linspace(0, 360, nsec + 1)
-    _roses = []
+    def _annular_wedge(theta0, theta1, r_lo, r_hi, n=6):
+        outer = np.linspace(theta0, theta1, n)
+        inner = outer[::-1]
+        xs = np.concatenate([r_hi * np.cos(outer), r_lo * np.cos(inner)])
+        ys = np.concatenate([r_hi * np.sin(outer), r_lo * np.sin(inner)])
+        return xs, ys
+
+    def wind_rose(dirs, speeds, weights, title, max_r):
+        total_w = weights.sum()
+        calm = speeds < CALM_THRESHOLD
+        calm_pct = weights[calm].sum() / total_w * 100
+
+        edges_deg = np.linspace(0, 360, NSEC + 1)
+        sector = np.clip(np.digitize(dirs[~calm], edges_deg) - 1, 0, NSEC - 1)
+        speed_bin = np.clip(np.digitize(speeds[~calm], SPEED_BINS) - 1, 0, len(SPEED_LABELS) - 1)
+        freq = np.zeros((NSEC, len(SPEED_LABELS)))
+        np.add.at(freq, (sector, speed_bin), weights[~calm])
+        freq = freq / total_w * 100
+
+        # petals start outside a small blank center "hole" (standard wind-rose
+        # convention) that displays the calm % without overlapping any wedge
+        hole_r = max_r * 0.14
+        polys = []
+        for i in range(NSEC):
+            c0, c1 = edges_deg[i], edges_deg[i + 1]
+            m0, m1 = np.radians(90 - c1), np.radians(90 - c0)
+            r_lo = hole_r
+            for k, label in enumerate(SPEED_LABELS):
+                r_hi = r_lo + freq[i, k]
+                if freq[i, k] > 0:
+                    xs, ys = _annular_wedge(m0, m1, r_lo, r_hi)
+                    polys.append({'x': xs, 'y': ys, 'speed (m/s)': label, 'pct': round(float(freq[i, k]), 2), 'dir': f'{c0:.0f}-{c1:.0f}'})
+                r_lo = r_hi
+        ring_step = max(1, round(max_r / 4))
+        rings_r = np.arange(ring_step, max_r + hole_r + ring_step, ring_step)
+        wedges = hv.Polygons(polys, vdims=['speed (m/s)', 'pct', 'dir']).opts(
+            color='speed (m/s)', cmap=SPEED_COLORS, line_color='white', line_width=0.5,
+            tools=['hover'], show_legend=False, colorbar=False,
+        )
+        rings = hv.Path([hv.Ellipse(0, 0, 2 * r).array() for r in rings_r]).opts(color='gray', line_width=0.5, line_dash='dotted')
+        hole = hv.Ellipse(0, 0, 2 * hole_r).opts(color='white', line_color='gray', line_width=0.75)
+        # offset labels off the N gridline (and away from the center label) at a fixed compass bearing
+        _label_bearing = np.radians(90 - 22)
+        ring_labels = hv.Labels({'x': rings_r * np.cos(_label_bearing), 'y': rings_r * np.sin(_label_bearing), 'text': [f'{r:g}%' for r in rings_r]}, ['x', 'y'], 'text').opts(text_font_size='7pt', text_color='gray', text_align='left')
+        compass_r = (max_r + hole_r) * 1.1
+        cxs = compass_r * np.cos(np.radians(90 - np.arange(0, 360, 45)))
+        cys = compass_r * np.sin(np.radians(90 - np.arange(0, 360, 45)))
+        compass = hv.Labels({'x': cxs, 'y': cys, 'text': COMPASS8}, ['x', 'y'], 'text').opts(text_font_size='9pt', text_color='gray')
+        center = hv.Labels({'x': [0], 'y': [0], 'text': [f'{calm_pct:.1f}% calm']}, ['x', 'y'], 'text').opts(text_font_size='7pt', text_color='dimgray', text_align='center', text_baseline='middle')
+        lim = (max_r + hole_r) * 1.22
+        return (rings * wedges * hole * ring_labels * compass * center).opts(
+            width=340, height=340, xaxis=None, yaxis=None, show_grid=False,
+            xlim=(-lim, lim), ylim=(-lim, lim), title=title, data_aspect=1,
+        )
+
+    def wind_rose_legend():
+        n = len(SPEED_LABELS)
+        swatch_data = [(0, n - 1 - i - 0.35, 0.6, n - 1 - i + 0.35, label) for i, label in enumerate(SPEED_LABELS)]
+        swatches = hv.Rectangles(swatch_data, vdims=['speed (m/s)']).opts(
+            color='speed (m/s)', cmap=SPEED_COLORS, line_color=None, show_legend=False,
+        )
+        labels = hv.Labels({'x': [0.9] * n, 'y': [n - 1 - i for i in range(n)], 'text': SPEED_LABELS}, ['x', 'y'], 'text').opts(
+            text_font_size='9pt', text_align='left', text_baseline='middle',
+        )
+        title = hv.Text(0, n + 0.3, 'Wind speed (m/s)').opts(text_font_size='9pt', text_align='left', text_font_style='bold')
+        return (swatches * labels * title).opts(
+            width=230, height=340, xaxis=None, yaxis=None, show_grid=False, toolbar=None,
+            xlim=(-0.4, 4.0), ylim=(-0.8, n + 0.9),
+        )
+    return wind_rose, wind_rose_legend
+
+@app.cell
+def _(np, hv, d, SEASON_ORDER, wind_rose, wind_rose_legend):
+    _season_data = {}
     for _s in SEASON_ORDER:
-        _sub = d[(d['season'] == _s) & d['wind_dir_deg'].notna()]
-        if _sub.empty:
-            continue
-        theta = (360 - _sub['wind_dir_deg']) % 360
-        sector = np.clip(np.digitize(theta.to_numpy(), edges) - 1, 0, nsec - 1)
-        _w = _sub['dt_s'].to_numpy()
-        counts = np.zeros(nsec)
-        np.add.at(counts, sector, _w)
-        if counts.sum() <= 0:
-            continue
-        counts = counts / counts.max() * 100
-        _roses.append(_wind_rose(counts, COLORS[_s], _s))
-    hv.Layout(_roses).cols(2).opts(title='Wind direction by season (time-weighted, 30° sectors; compass: 0°=N, clockwise)')
+        _sub = d[(d['season'] == _s) & d['wind_dir_deg'].notna() & d['wind_speed_m_s'].notna()]
+        if not _sub.empty:
+            _season_data[_s] = (_sub['wind_dir_deg'].to_numpy(), _sub['wind_speed_m_s'].to_numpy(), _sub['dt_s'].to_numpy())
+
+    # shared radial scale across all four roses so petal lengths are comparable season to season
+    def _max_freq(dirs, speeds, weights):
+        edges_deg = np.linspace(0, 360, 16 + 1)
+        sector = np.clip(np.digitize(dirs, edges_deg) - 1, 0, 15)
+        totals = np.zeros(16)
+        np.add.at(totals, sector, weights)
+        return (totals / weights.sum() * 100).max()
+
+    _max_r = max(_max_freq(*v) for v in _season_data.values()) if _season_data else 10.0
+    _roses = [wind_rose(*_season_data[_s], _s, _max_r) for _s in SEASON_ORDER if _s in _season_data]
+    # 3 columns so the legend lands in the upper right: [winter, spring, legend] / [summer, fall]
+    _panels = _roses[:2] + [wind_rose_legend()] + _roses[2:]
+    hv.Layout(_panels).cols(3).opts(title='Wind direction by season (time-weighted; 0°=N, clockwise)')
+    return
+
+@app.cell
+def _(marimo):
+    marimo.md("""
+    **Direction accuracy note:** Armstrong/Atlantis's raw direction column
+    (`wxtp_dm`/`wxts_dm`) is relative to the bow, not true compass direction,
+    despite its name. This was verified by checking direction stability
+    during heading changes across three cruises (AR16, AR62, AT46): the raw
+    value shifts almost in lockstep with heading (regression slope -0.56 to
+    -0.8), while `(wxtp_dm + true heading) % 360` is far more stable (median
+    instability drops from 31-42° to 8-13° during turns >10°). The download
+    pipeline now applies this correction using each row's true heading
+    (`hdt`); cruises without a heading column are excluded rather than
+    publishing uncorrected relative angles as absolute. Endeavor, Sharp, and
+    Atlantic Explorer already report true direction directly. See
+    `provenance.json` for the full methodology.
+    """)
     return
 
 @app.cell
