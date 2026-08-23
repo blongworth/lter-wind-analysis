@@ -1,0 +1,15 @@
+[project]
+name = "lter-wind-analysis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bokeh>=3.9.2",
+    "datashader>=0.19.1",
+    "holoviews>=1.19",
+    "marimo>=0.13",
+    "numpy>=2.2.6",
+    "pandas>=2.0",
+    "panel>=1.4",
+]
