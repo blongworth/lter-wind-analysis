@@ -55,7 +55,7 @@ def _(marimo, prov, df):
     | **Variables** | true wind speed at the bow anemometer, converted to m/s (Sharp, Atlantic Explorer, and Endeavor sensors report knots); true wind direction, degrees from north (Armstrong/Atlantis direction is corrected from relative-to-bow to true using ship heading — see the note below the wind roses) |
     | **Season** | by cruise start month: winter {{12,1,2}}, spring {{3,4,5}}, summer {{6,7,8}}, fall {{9,10,11}} |
     | **QA** | NODATA/NAN sentinels and non-physical speeds (<0 or ≥100 m/s) dropped. **True wind only** — cruises with only relative wind are excluded (see `cruises.csv` notes). No gust de-spiking, so a few large spikes remain and are visible in the distribution tail. |
-    | **Discovery** | endpoints and vessel→column mapping located via the `nes-lter-mcp` MCP server (`find_cruises`, `query_underway`, `get_dataset_schema`, `resolve_variable`), except the Endeavor unit, which that server's `UNDERWAY_VARIABLE_ALIASES` table gets wrong — confirmed in knots by vectorially reconstructing true wind from relative wind + heading + ship speed (median residual 2.4% across 4,428 EN608 rows). Armstrong/Atlantis's unit could not be independently confirmed the same way (no paired relative-wind data) and is left as m/s on climatological plausibility only — see `provenance.json` for both. |
+    | **Discovery** | endpoints and vessel→column mapping located via the `nes-lter-mcp` MCP server (`find_cruises`, `query_underway`, `get_dataset_schema`, `resolve_variable`), except the Endeavor unit and the Armstrong/Atlantis direction reference, which that server's `UNDERWAY_VARIABLE_ALIASES` table gets wrong (see notes below the survival curves and wind roses). Armstrong/Atlantis speed and direction were also cross-checked against independent OOI Pioneer Array buoy data — see `provenance.json` for the full writeup. |
     | **Download** | `scripts/download_wind.py` (re-runnable; writes `data/raw/`, `data/processed/wind.csv`, `data/processed/cruises.csv`, `data/processed/provenance.json`) |
 
     **Coverage:** {prov['totals']['cruises_with_wind']} of {prov['totals']['cruises_in_catalog']} catalog cruises contributed wind · {prov['totals']['wind_readings']:,} readings · {_span}
@@ -333,8 +333,20 @@ def _(marimo):
     pipeline now applies this correction using each row's true heading
     (`hdt`); cruises without a heading column are excluded rather than
     publishing uncorrected relative angles as absolute. Endeavor, Sharp, and
-    Atlantic Explorer already report true direction directly. See
-    `provenance.json` for the full methodology.
+    Atlantic Explorer already report true direction directly.
+
+    **Independent validation:** since Armstrong/Atlantis account for most of
+    the high-wind events in section 4, both corrected direction and speed
+    were cross-checked against OOI Pioneer Array METBK buoys moored directly
+    in the NES-LTER sampling area (unambiguous m/s, no ship-relative angles
+    to correct). Matching ~72,600 Armstrong/Atlantis readings within 5 km and
+    10 minutes of a buoy gives a median direction error of 7.7° and a median
+    ship/buoy speed ratio of 1.27; the identical comparison for Endeavor
+    (already confirmed correct) gives 7.6° and 1.23 over ~8,400 matches —
+    Armstrong/Atlantis tracks its own control group closely, and the >1
+    ratio for both is the expected effect of a ship's bow anemometer sitting
+    well above a buoy's ~3-4 m sensor, not an error. See `provenance.json`
+    for the full methodology.
     """)
     return
 
