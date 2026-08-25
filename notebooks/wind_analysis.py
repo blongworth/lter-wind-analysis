@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#     "marimo>=0.24.0",
+# ]
+# ///
 import marimo
 
 __generated_with = "0.24.0"
@@ -13,16 +19,10 @@ def _():
     import holoviews as hv
     import marimo
     import numpy as np
-    import pandas as pd
+    import polars as pl
 
     hv.extension("bokeh")
 
-    # Pan and wheel-zoom stay in the toolbar (still clickable) but are not the
-    # active-by-default tool, so a plain scroll/drag over a chart scrolls the
-    # page instead of panning/zooming it, until a user opts in. active_tools=[]
-    # alone leaves active_scroll at bokeh's "auto" (which still activates
-    # wheel-zoom when it's the only scroll-capable tool), so the toolbar is
-    # set directly via a hook instead.
     def _no_active_tools(plot, element):
         plot.state.toolbar.active_drag = None
         plot.state.toolbar.active_scroll = None
@@ -36,12 +36,16 @@ def _():
         hv.opts.Polygons(hooks=[_no_active_tools]),
         hv.opts.Rectangles(hooks=[_no_active_tools]),
     )
-    return (marimo, json, math, Path, np, pd, hv)
+    return Path, hv, json, marimo, math, np, pl
 
 
 @app.cell
-def _(json, Path, pd):
+def _(Path, json, pl):
     # Load combined wind readings, the cruise catalog, and the provenance record.
+    #
+    # wind.parquet stores 'date' as a real datetime already (parsed once, at
+    # download time) and is far smaller than the equivalent CSV, which is why
+    # this is the one file in the project that isn't CSV.
     #
     # dt_s is a per-reading time weight (seconds until the next reading in the
     # same cruise, capped at 1 h) so fractions below are time-weighted, not a
@@ -49,36 +53,27 @@ def _(json, Path, pd):
     # >1 h gap inherit the cruise's median weight so they are not double- or
     # zero-counted.
     base = Path("data/processed")
-    df = (
-        pd.read_csv(base / "wind.csv")
-        .sort_values(["cruise", "date"])
-        .reset_index(drop=True)
+    df = pl.read_parquet(base / "wind.parquet").sort(["cruise", "date"])
+    _dt_raw = pl.col("date").diff().over("cruise").dt.total_seconds()
+    df = df.with_columns(
+        pl.when(_dt_raw.is_not_null() & (_dt_raw <= 3600))
+        .then(_dt_raw)
+        .otherwise(0.0)
+        .alias("dt_s")
     )
-    # ISO8601: the API mixes second- and microsecond-precision timestamps (strict
-    # first-row inference would drop ~70% of rows); utc=True + tz_localize(None)
-    # normalizes any tz-offset rows to naive UTC so numpy datetime64 math works below.
-    df["date"] = pd.to_datetime(
-        df["date"], errors="coerce", format="ISO8601", utc=True
-    ).dt.tz_localize(None)
-    dropped = df["date"].isna().sum()
-    if dropped:
-        df = df.dropna(subset=["date"]).reset_index(drop=True)
-    _dt = df.groupby("cruise")["date"].diff().dt.total_seconds()
-    df["dt_s"] = _dt.where(_dt <= 3600, 0.0).to_numpy()
-    df["dt_s"] = pd.Series(
-        df["dt_s"].where(
-            ~(df["dt_s"] == 0), df.groupby("cruise")["dt_s"].transform("median")
-        ),
-        index=df.index,
+    df = df.with_columns(
+        pl.when(pl.col("dt_s") == 0)
+        .then(pl.col("dt_s").median().over("cruise"))
+        .otherwise(pl.col("dt_s"))
+        .alias("dt_s")
     )
-    df["wind_dir_deg"] = pd.to_numeric(df["wind_dir_deg"], errors="coerce")
-    cruises = pd.read_csv(base / "cruises.csv")
+    cruises = pl.read_csv(base / "cruises.csv")
     prov = json.loads((base / "provenance.json").read_text())
-    return (df, cruises, prov)
+    return df, prov
 
 
 @app.cell
-def _(marimo, prov, df):
+def _(df, marimo, prov):
     _span = f"{df['date'].min():%Y}–{df['date'].max():%Y}"
     marimo.md(f"""
     ## Data provenance
@@ -87,12 +82,12 @@ def _(marimo, prov, df):
     |---|---|
     | **Source** | NES-LTER API, `https://nes-lter-api.whoi.edu` |
     | **Cruise catalog** | `/api/ctd/cruises/all` |
-    | **Underway data** | `/api/underway/{{cruise}}.csv` (one CSV per cruise, stored in `data/raw/`) |
+    | **Underway data** | `/api/underway/{{cruise}}.csv` (one CSV per cruise; parsed and stored as `data/raw/{{cruise}}.parquet`) |
     | **Variables** | true wind speed at the bow anemometer, converted to m/s (Sharp, Atlantic Explorer, and Endeavor sensors report knots); true wind direction, degrees from north (Armstrong/Atlantis direction is corrected from relative-to-bow to true using ship heading — see the note below the wind roses) |
     | **Season** | by cruise start month: winter {{12,1,2}}, spring {{3,4,5}}, summer {{6,7,8}}, fall {{9,10,11}} |
     | **QA** | NODATA/NAN sentinels and non-physical speeds (<0 or ≥100 m/s) dropped. **True wind only** — cruises with only relative wind are excluded (see `cruises.csv` notes). No gust de-spiking, so a few large spikes remain and are visible in the distribution tail. |
     | **Discovery** | endpoints and vessel→column mapping located via the `nes-lter-mcp` MCP server (`find_cruises`, `query_underway`, `get_dataset_schema`, `resolve_variable`), except the Endeavor unit and the Armstrong/Atlantis direction reference, which that server's `UNDERWAY_VARIABLE_ALIASES` table gets wrong (see notes below the survival curves and wind roses). Armstrong/Atlantis speed and direction were also cross-checked against independent OOI Pioneer Array buoy data — see `provenance.json` for the full writeup. |
-    | **Download** | `scripts/download_wind.py` (re-runnable; writes `data/raw/`, `data/processed/wind.csv`, `data/processed/cruises.csv`, `data/processed/provenance.json`) |
+    | **Download** | `scripts/download_wind.py` (re-runnable; writes `data/raw/`, `data/processed/wind.parquet`, `data/processed/cruises.csv`, `data/processed/provenance.json`; data manipulation throughout uses polars, with parquet for the two large per-reading tables) |
 
     **Coverage:** {prov["totals"]["cruises_with_wind"]} of {prov["totals"]["cruises_in_catalog"]} catalog cruises contributed wind · {prov["totals"]["wind_readings"]:,} readings · {_span}
     """)
@@ -113,21 +108,25 @@ def _(marimo):
 @app.cell
 def _(df, marimo):
     x = marimo.ui.slider(
-        start=0, stop=30, step=0.5, value=12, label="threshold x (m/s)"
+        start=0, stop=30, step=0.5, value=13, label="threshold x (m/s)"
     )
     season = marimo.ui.dropdown(
-        options=["all"] + sorted(df["season"].dropna().unique().tolist()),
+        options=["all"] + sorted(df["season"].drop_nulls().unique().to_list()),
         value="all",
         label="season",
     )
     marimo.hstack([x, season])
-    return (x, season)
+    return season, x
 
 
 @app.cell
-def _(df, season):
+def _(df, pl, season):
     # Working frame restricted to the selected season.
-    d = df if season.value == "all" else df[df["season"] == season.value]
+    d = (
+        df
+        if season.value == "all"
+        else df.filter(pl.col("season") == season.value)
+    )
     return (d,)
 
 
@@ -140,7 +139,7 @@ def _():
         "summer": "#e4a72c",
         "fall": "#b8629b",
     }
-    return (SEASON_ORDER, COLORS)
+    return COLORS, SEASON_ORDER
 
 
 @app.cell
@@ -152,7 +151,7 @@ def _(marimo):
 
 
 @app.cell
-def _(np, hv, d, x, SEASON_ORDER, COLORS):
+def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
     # Pre-bin with numpy instead of handing raw per-reading arrays to the plot:
     # a density histogram only ever needs the bin counts, so this is the
     # "resampling" step for this chart and keeps the payload tiny regardless
@@ -160,7 +159,11 @@ def _(np, hv, d, x, SEASON_ORDER, COLORS):
     _edges = np.linspace(0, max(d["wind_speed_m_s"].max(), x.value), 81)
     _hists = []
     for _s in SEASON_ORDER:
-        _v = d.loc[d["season"] == _s, "wind_speed_m_s"].dropna().to_numpy()
+        _v = (
+            d.filter(pl.col("season") == _s)["wind_speed_m_s"]
+            .drop_nulls()
+            .to_numpy()
+        )
         if len(_v):
             _counts, _ = np.histogram(_v, bins=_edges, density=True)
             _hists.append(
@@ -193,18 +196,21 @@ def _(marimo):
 
 
 @app.cell
-def _(np, hv, d, x, SEASON_ORDER, COLORS):
+def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
     # Each season's exact survival function has one point per underway reading
     # (up to ~10^5-10^6) and looks jagged at that resolution. Interpolating it
     # onto a shared 300-point grid is this chart's resampling step: tiny
-    # payload, a smooth line, and (unlike the previous datashaded image) a
-    # plain Curve that can carry a real legend entry.
+    # payload, a smooth line, and (unlike a datashaded image) a plain Curve
+    # that can carry a real legend entry.
     _grid = np.linspace(0, max(d["wind_speed_m_s"].max(), x.value), 300)
     _curves = []
     _fracs = {}
     for _s in SEASON_ORDER:
-        _sub = d[d["season"] == _s].dropna(subset=["wind_speed_m_s"])
-        (_v, _w) = (_sub["wind_speed_m_s"].to_numpy(), _sub["dt_s"].to_numpy())
+        _sub = d.filter(pl.col("season") == _s).drop_nulls("wind_speed_m_s")
+        (_v, _w) = (
+            _sub["wind_speed_m_s"].to_numpy(),
+            _sub["dt_s"].to_numpy(),
+        )
         _total = _w.sum()
         if len(_v) < 10 or _total <= 0:
             continue
@@ -222,9 +228,13 @@ def _(np, hv, d, x, SEASON_ORDER, COLORS):
         )
         _fracs[_s] = _w[_v >= x.value].sum() / _total * 100
     # threshold answers as a text block next to the legend instead of scattered on the curves
-    _note = "\n".join(f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs)
+    _note = "\n".join(
+        f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs
+    )
     _note_label = hv.Labels(
-        {"x": [_grid[-1] * 0.97], "y": [62], "text": [_note]}, ["x", "y"], "text"
+        {"x": [_grid[-1] * 0.97], "y": [62], "text": [_note]},
+        ["x", "y"],
+        "text",
     ).opts(
         text_align="right",
         text_baseline="top",
@@ -256,9 +266,9 @@ def _(marimo, x):
 
 
 @app.cell
-def _(marimo, pd, d, x):
+def _(d, marimo, pl, x):
     rows = []
-    for _s, _sub in d.groupby("season"):
+    for (_s,), _sub in d.group_by("season"):
         _t = _sub["dt_s"].sum()
         if _t > 0:
             rows.append(
@@ -267,7 +277,9 @@ def _(marimo, pd, d, x):
                     "hours": round(_t / 3600, 1),
                     "readings": len(_sub),
                     "% time >= x": round(
-                        _sub.loc[_sub["wind_speed_m_s"] >= x.value, "dt_s"].sum()
+                        _sub.filter(pl.col("wind_speed_m_s") >= x.value)[
+                            "dt_s"
+                        ].sum()
                         / _t
                         * 100,
                         2,
@@ -281,11 +293,14 @@ def _(marimo, pd, d, x):
             "hours": round(_total / 3600, 1),
             "readings": len(d),
             "% time >= x": round(
-                d.loc[d["wind_speed_m_s"] >= x.value, "dt_s"].sum() / _total * 100, 2
+                d.filter(pl.col("wind_speed_m_s") >= x.value)["dt_s"].sum()
+                / _total
+                * 100,
+                2,
             ),
         }
     )
-    _tab = pd.DataFrame(rows).sort_values("season").reset_index(drop=True)
+    _tab = pl.DataFrame(rows).sort("season")
     marimo.ui.table(_tab, selection=None, page_size=10)
     return
 
@@ -299,35 +314,33 @@ def _(marimo, x):
 
 
 @app.cell
-def _(marimo, pd, hv, d, x, COLORS):
+def _(COLORS, d, hv, marimo, pl, x):
     recs = []
-    for _c, _sub in d.groupby("cruise"):
+    for (_c,), _sub in d.group_by("cruise"):
         _t = _sub["dt_s"].sum()
         if _t <= 0:
             continue
         recs.append(
             {
                 "cruise": _c,
-                "vessel": _sub["vessel"].iloc[0],
-                "season": _sub["season"].iloc[0],
+                "vessel": _sub["vessel"][0],
+                "season": _sub["season"][0],
                 "hours": round(_t / 3600, 1),
                 "% above x": round(
-                    _sub.loc[_sub["wind_speed_m_s"] >= x.value, "dt_s"].sum()
+                    _sub.filter(pl.col("wind_speed_m_s") >= x.value)[
+                        "dt_s"
+                    ].sum()
                     / _t
                     * 100,
                     2,
                 ),
             }
         )
-    _tab = (
-        pd.DataFrame(recs)
-        .sort_values("% above x", ascending=False)
-        .reset_index(drop=True)
-    )
+    _tab = pl.DataFrame(recs).sort("% above x", descending=True)
     # ~70 cruises is small enough to render directly, no resampling needed.
     _bars = hv.Bars(
         _tab,
-        kdims=[hv.Dimension("cruise", values=_tab["cruise"].tolist())],
+        kdims=[hv.Dimension("cruise", values=_tab["cruise"].to_list())],
         vdims=["% above x", "season"],
     )
     _bars = _bars.opts(
@@ -364,12 +377,14 @@ def _(marimo):
 
 
 @app.cell
-def _(np, hv):
+def _(hv, np):
     # Bokeh (holoviews' backend here) has no native polar coordinate system,
     # so each rose is built from Cartesian annular-wedge polygons -- one per
     # 16-sector x speed-bin combination. Data is tiny per rose (16 sectors x
     # 8 speed bins x 4 seasons) so no resampling is needed here.
-    CALM_THRESHOLD = 1.0  # m/s; shown as a single number in the center of each rose
+    CALM_THRESHOLD = (
+        1.0  # m/s; shown as a single number in the center of each rose
+    )
     # Bin edges chosen from the data's own distribution (99% of readings fall under
     # 19 m/s, max ~29 m/s), colored with the blue -> green -> yellow -> orange -> red
     # -> magenta progression used by windy.com / earth.nullschool-style wind speed
@@ -377,7 +392,16 @@ def _(np, hv):
     # deliberate exception since matching that specific, widely recognized
     # convention was requested.
     SPEED_BINS = [CALM_THRESHOLD, 4, 7, 10, 13, 16, 19, 22, np.inf]
-    SPEED_LABELS = ["1–4", "4–7", "7–10", "10–13", "13–16", "16–19", "19–22", "22+"]
+    SPEED_LABELS = [
+        "1–4",
+        "4–7",
+        "7–10",
+        "10–13",
+        "13–16",
+        "16–19",
+        "19–22",
+        "22+",
+    ]
     SPEED_COLORS = {
         "1–4": "#4a7bd4",
         "4–7": "#35a6d9",
@@ -406,7 +430,9 @@ def _(np, hv):
         edges_deg = np.linspace(0, 360, NSEC + 1)
         sector = np.clip(np.digitize(dirs[~calm], edges_deg) - 1, 0, NSEC - 1)
         speed_bin = np.clip(
-            np.digitize(speeds[~calm], SPEED_BINS) - 1, 0, len(SPEED_LABELS) - 1
+            np.digitize(speeds[~calm], SPEED_BINS) - 1,
+            0,
+            len(SPEED_LABELS) - 1,
         )
         freq = np.zeros((NSEC, len(SPEED_LABELS)))
         np.add.at(freq, (sector, speed_bin), weights[~calm])
@@ -445,9 +471,9 @@ def _(np, hv):
             show_legend=False,
             colorbar=False,
         )
-        rings = hv.Path([hv.Ellipse(0, 0, 2 * r).array() for r in rings_r]).opts(
-            color="gray", line_width=0.5, line_dash="dotted"
-        )
+        rings = hv.Path(
+            [hv.Ellipse(0, 0, 2 * r).array() for r in rings_r]
+        ).opts(color="gray", line_width=0.5, line_dash="dotted")
         hole = hv.Ellipse(0, 0, 2 * hole_r).opts(
             color="white", line_color="gray", line_width=0.75
         )
@@ -469,7 +495,9 @@ def _(np, hv):
             {"x": cxs, "y": cys, "text": COMPASS8}, ["x", "y"], "text"
         ).opts(text_font_size="9pt", text_color="gray")
         center = hv.Labels(
-            {"x": [0], "y": [0], "text": [f"{calm_pct:.1f}% calm"]}, ["x", "y"], "text"
+            {"x": [0], "y": [0], "text": [f"{calm_pct:.1f}% calm"]},
+            ["x", "y"],
+            "text",
         ).opts(
             text_font_size="7pt",
             text_color="dimgray",
@@ -502,7 +530,11 @@ def _(np, hv):
             show_legend=False,
         )
         labels = hv.Labels(
-            {"x": [0.9] * n, "y": [n - 1 - i for i in range(n)], "text": SPEED_LABELS},
+            {
+                "x": [0.9] * n,
+                "y": [n - 1 - i for i in range(n)],
+                "text": SPEED_LABELS,
+            },
             ["x", "y"],
             "text",
         ).opts(
@@ -528,15 +560,15 @@ def _(np, hv):
 
 
 @app.cell
-def _(np, hv, d, SEASON_ORDER, wind_rose, wind_rose_legend):
+def _(SEASON_ORDER, d, hv, np, pl, wind_rose, wind_rose_legend):
     _season_data = {}
     for _s in SEASON_ORDER:
-        _sub = d[
-            (d["season"] == _s)
-            & d["wind_dir_deg"].notna()
-            & d["wind_speed_m_s"].notna()
-        ]
-        if not _sub.empty:
+        _sub = d.filter(
+            (pl.col("season") == _s)
+            & pl.col("wind_dir_deg").is_not_null()
+            & pl.col("wind_speed_m_s").is_not_null()
+        )
+        if len(_sub):
             _season_data[_s] = (
                 _sub["wind_dir_deg"].to_numpy(),
                 _sub["wind_speed_m_s"].to_numpy(),
@@ -551,7 +583,11 @@ def _(np, hv, d, SEASON_ORDER, wind_rose, wind_rose_legend):
         np.add.at(totals, sector, weights)
         return (totals / weights.sum() * 100).max()
 
-    _max_r = max(_max_freq(*v) for v in _season_data.values()) if _season_data else 10.0
+    _max_r = (
+        max(_max_freq(*v) for v in _season_data.values())
+        if _season_data
+        else 10.0
+    )
     _roses = [
         wind_rose(*_season_data[_s], _s, _max_r)
         for _s in SEASON_ORDER
@@ -628,17 +664,17 @@ def _(marimo):
 @app.cell
 def _(marimo):
     event_threshold = marimo.ui.slider(
-        start=5, stop=30, step=0.5, value=15, label="event threshold (m/s)"
+        start=5, stop=30, step=0.5, value=13, label="event threshold (m/s)"
     )
     min_duration = marimo.ui.slider(
-        start=1, stop=120, step=1, value=10, label="min event duration (min)"
+        start=1, stop=240, step=1, value=90, label="min event duration (min)"
     )
     marimo.hstack([event_threshold, min_duration])
-    return (event_threshold, min_duration)
+    return event_threshold, min_duration
 
 
 @app.cell
-def _(math, np, pd, Path, df, marimo, event_threshold, min_duration):
+def _(Path, df, event_threshold, marimo, math, min_duration, np, pl):
     # Detect high-wind events and write the catalog.
     threshold_val = event_threshold.value
     duration_val = min_duration.value
@@ -649,7 +685,9 @@ def _(math, np, pd, Path, df, marimo, event_threshold, min_duration):
         return math.degrees(math.atan2(np.sin(r).sum(), np.cos(r).sum())) % 360
 
     events = []
-    for _c, _sub in df.sort_values(["cruise", "date"]).groupby("cruise"):
+    for (_c,), _sub in df.sort(["cruise", "date"]).group_by(
+        "cruise", maintain_order=True
+    ):
         _v = _sub["wind_speed_m_s"].to_numpy()
         if np.isnan(_v).all():
             continue
@@ -657,7 +695,10 @@ def _(math, np, pd, Path, df, marimo, event_threshold, min_duration):
         dirg = _sub["wind_dir_deg"].to_numpy()
         _dt = np.zeros(len(_v))
         if len(_v) > 1:
-            _dt[:-1] = np.diff(_t) / 1_000_000_000.0
+            # unit-independent: polars stores datetime64 in microsecond
+            # resolution (unlike pandas' nanoseconds), so dividing by a fixed
+            # power of 10 would silently be off by 1000x if that ever changes.
+            _dt[:-1] = np.diff(_t) / np.timedelta64(1, "s")
         _dt = np.where(np.isfinite(_dt) & (_dt <= gap_s), _dt, np.inf)
         hot = _v >= threshold_val
         (_i, n) = (0, len(_v))
@@ -668,19 +709,21 @@ def _(math, np, pd, Path, df, marimo, event_threshold, min_duration):
             j = _i
             while j + 1 < n and hot[j + 1] and (_dt[j] != np.inf):
                 j += 1
-            dur_min = (pd.Timestamp(_t[j]) - pd.Timestamp(_t[_i])).total_seconds() / 60
+            dur_min = (_t[j] - _t[_i]) / np.timedelta64(1, "m")
             if dur_min >= float(duration_val):
                 seg_dir = dirg[_i : j + 1]
                 events.append(
                     {
                         "cruise": _c,
-                        "vessel": _sub["vessel"].iloc[0],
-                        "season": _sub["season"].iloc[0],
-                        "start": str(pd.Timestamp(_t[_i])),
-                        "end": str(pd.Timestamp(_t[j])),
+                        "vessel": _sub["vessel"][0],
+                        "season": _sub["season"][0],
+                        "start": str(_t[_i]),
+                        "end": str(_t[j]),
                         "duration_min": round(float(dur_min), 1),
                         "peak_m_s": round(float(np.nanmax(_v[_i : j + 1])), 2),
-                        "mean_m_s": round(float(np.nanmean(_v[_i : j + 1])), 2),
+                        "mean_m_s": round(
+                            float(np.nanmean(_v[_i : j + 1])), 2
+                        ),
                         "mean_dir_deg": round(circular_mean(seg_dir), 1)
                         if np.isfinite(seg_dir).any()
                         else None,
@@ -689,10 +732,10 @@ def _(math, np, pd, Path, df, marimo, event_threshold, min_duration):
             _i = j + 1
 
     ev = (
-        pd.DataFrame(events).sort_values(["cruise", "start"]).reset_index(drop=True)
+        pl.DataFrame(events).sort(["cruise", "start"])
         if events
-        else pd.DataFrame(
-            columns=[
+        else pl.DataFrame(
+            schema=[
                 "cruise",
                 "vessel",
                 "season",
@@ -706,9 +749,9 @@ def _(math, np, pd, Path, df, marimo, event_threshold, min_duration):
         )
     )
     if len(ev):
-        ev.to_csv(Path("data/processed/high_wind_events.csv"), index=False)
+        ev.write_csv(Path("data/processed/high_wind_events.csv"))
     _summary = marimo.md(
-        f"**{len(ev)} high-wind events** (≥ {threshold_val:g} m/s, lasting ≥ {duration_val:g} min) across {ev['cruise'].nunique() if len(ev) else 0} cruises — written to `data/processed/high_wind_events.csv`."
+        f"**{len(ev)} high-wind events** (≥ {threshold_val:g} m/s, lasting ≥ {duration_val:g} min) across {ev['cruise'].n_unique() if len(ev) else 0} cruises — written to `data/processed/high_wind_events.csv`."
     )
     marimo.vstack(
         [_summary]

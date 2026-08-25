@@ -11,11 +11,19 @@ table, which was discovered/verified via the MCP tool ``resolve_variable``.
 
 Outputs
 -------
-``data/raw/{cruise}.csv``     per-cruise wind readings (date, wind_speed_m_s,
-                              wind_dir_deg, lat, lon)
-``data/processed/wind.csv``   combined readings with cruise/vessel/season
-``data/processed/cruises.csv`` cruise catalog with wind-availability status
+``data/raw/{cruise}.parquet``      per-cruise wind readings (date, wind_speed_m_s,
+                                   wind_dir_deg, lat, lon)
+``data/processed/wind.parquet``    combined readings with cruise/vessel/season
+``data/processed/cruises.csv``     cruise catalog with wind-availability status
 ``data/processed/provenance.json`` full provenance record
+
+Data manipulation (assembling readings into tables, date parsing, filtering,
+and both per-cruise and combined output) is done with polars. The two large,
+per-reading tables are written as Parquet, which is both far smaller than CSV
+for this data and preserves the parsed datetime type, so the notebook that
+reads them back doesn't need to re-parse timestamps at all. The small
+cruise-catalog metadata stays CSV since it's human-readable and not
+performance-sensitive (74 rows).
 """
 
 from __future__ import annotations
@@ -29,6 +37,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
+
+import polars as pl
 
 API = "https://nes-lter-api.whoi.edu"
 KT_TO_MS = 0.514444
@@ -179,7 +189,8 @@ def main() -> None:
     print(f"Fetching cruise catalog: {API}/api/ctd/cruises/all")
     cruises = json.loads(fetch(f"{API}/api/ctd/cruises/all"))
 
-    wind_rows: list[dict] = []
+    wind_frames: list[pl.DataFrame] = []
+    n_wind_readings = 0
     cruise_records: list[dict] = []
     for i, c in enumerate(cruises, 1):
         name, vessel = c["name"], c.get("vessel_name")
@@ -282,10 +293,10 @@ def main() -> None:
                     "cruise": name,
                     "vessel": vessel,
                     "season": record["season"],
-                    "wind_speed_m_s": f"{ws:.4f}",
-                    "wind_dir_deg": f"{wd:.1f}" if wd is not None else "",
-                    "lat": f"{lat:.4f}" if lat is not None else "",
-                    "lon": f"{lon:.4f}" if lon is not None else "",
+                    "wind_speed_m_s": round(ws, 4),
+                    "wind_dir_deg": round(wd, 1) if wd is not None else None,
+                    "lat": round(lat, 4) if lat is not None else None,
+                    "lon": round(lon, 4) if lon is not None else None,
                 }
             )
         record["n_wind_readings"] = len(per_cruise)
@@ -294,31 +305,30 @@ def main() -> None:
             record["notes"].append(
                 f"columns present ({speed[0]}, {direction[0]}) but {n_rows} rows had no valid values"
             )
-        wind_rows.extend(per_cruise)
+        else:
+            # Parse the date column once here (polars' auto-inference handles the
+            # API's mix of second- and microsecond-precision timestamps within a
+            # single cruise) so it's written to parquet as a real datetime -- the
+            # notebook that reads it back needs no ISO8601 string parsing at all.
+            cruise_df = pl.DataFrame(per_cruise).with_columns(
+                pl.col("date")
+                .str.to_datetime(strict=False, time_zone="UTC")
+                .dt.replace_time_zone(None)
+            )
+            cruise_df.write_parquet(raw_dir / f"{name}.parquet")
+            wind_frames.append(cruise_df)
+            n_wind_readings += len(per_cruise)
         cruise_records.append(record)
         print(f"    rows={n_rows}, wind readings={len(per_cruise)}")
 
-    # per-cruise raw files
-    by_cruise: dict[str, list[dict]] = {}
-    for r in wind_rows:
-        by_cruise.setdefault(r["cruise"], []).append(r)
-    for name, rows in by_cruise.items():
-        with open(raw_dir / f"{name}.csv", "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0]))
-            w.writeheader()
-            w.writerows(rows)
-
     # combined processed file
-    with open(proc_dir / "wind.csv", "w", newline="") as f:
-        if wind_rows:
-            w = csv.DictWriter(f, fieldnames=list(wind_rows[0]))
-            w.writeheader()
-            w.writerows(wind_rows)
+    if wind_frames:
+        pl.concat(wind_frames).write_parquet(proc_dir / "wind.parquet")
 
-    with open(proc_dir / "cruises.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(cruise_records[0]))
-        w.writeheader()
-        w.writerows(cruise_records)
+    cruises_df = pl.DataFrame(
+        [{**r, "notes": "; ".join(r["notes"])} for r in cruise_records]
+    )
+    cruises_df.write_csv(proc_dir / "cruises.csv")
 
     provenance = {
         "project": "NES-LTER underway wind analysis",
@@ -375,7 +385,7 @@ def main() -> None:
         "totals": {
             "cruises_in_catalog": len(cruises),
             "cruises_with_wind": sum(1 for r in cruise_records if r["status"] == "ok"),
-            "wind_readings": len(wind_rows),
+            "wind_readings": n_wind_readings,
         },
     }
     with open(proc_dir / "provenance.json", "w") as f:
