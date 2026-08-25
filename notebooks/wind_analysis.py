@@ -16,6 +16,7 @@ def _():
     import math
     from pathlib import Path
 
+    import altair as alt
     import holoviews as hv
     import marimo
     import numpy as np
@@ -36,7 +37,7 @@ def _():
         hv.opts.Polygons(hooks=[_no_active_tools]),
         hv.opts.Rectangles(hooks=[_no_active_tools]),
     )
-    return Path, hv, json, marimo, math, np, pl
+    return Path, alt, hv, json, marimo, math, np, pl
 
 
 @app.cell
@@ -122,11 +123,7 @@ def _(df, marimo):
 @app.cell
 def _(df, pl, season):
     # Working frame restricted to the selected season.
-    d = (
-        df
-        if season.value == "all"
-        else df.filter(pl.col("season") == season.value)
-    )
+    d = df if season.value == "all" else df.filter(pl.col("season") == season.value)
     return (d,)
 
 
@@ -159,11 +156,7 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
     _edges = np.linspace(0, max(d["wind_speed_m_s"].max(), x.value), 81)
     _hists = []
     for _s in SEASON_ORDER:
-        _v = (
-            d.filter(pl.col("season") == _s)["wind_speed_m_s"]
-            .drop_nulls()
-            .to_numpy()
-        )
+        _v = d.filter(pl.col("season") == _s)["wind_speed_m_s"].drop_nulls().to_numpy()
         if len(_v):
             _counts, _ = np.histogram(_v, bins=_edges, density=True)
             _hists.append(
@@ -228,9 +221,7 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
         )
         _fracs[_s] = _w[_v >= x.value].sum() / _total * 100
     # threshold answers as a text block next to the legend instead of scattered on the curves
-    _note = "\n".join(
-        f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs
-    )
+    _note = "\n".join(f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs)
     _note_label = hv.Labels(
         {"x": [_grid[-1] * 0.97], "y": [62], "text": [_note]},
         ["x", "y"],
@@ -277,9 +268,7 @@ def _(d, marimo, pl, x):
                     "hours": round(_t / 3600, 1),
                     "readings": len(_sub),
                     "% time >= x": round(
-                        _sub.filter(pl.col("wind_speed_m_s") >= x.value)[
-                            "dt_s"
-                        ].sum()
+                        _sub.filter(pl.col("wind_speed_m_s") >= x.value)["dt_s"].sum()
                         / _t
                         * 100,
                         2,
@@ -327,9 +316,7 @@ def _(COLORS, d, hv, marimo, pl, x):
                 "season": _sub["season"][0],
                 "hours": round(_t / 3600, 1),
                 "% above x": round(
-                    _sub.filter(pl.col("wind_speed_m_s") >= x.value)[
-                        "dt_s"
-                    ].sum()
+                    _sub.filter(pl.col("wind_speed_m_s") >= x.value)["dt_s"].sum()
                     / _t
                     * 100,
                     2,
@@ -377,14 +364,11 @@ def _(marimo):
 
 
 @app.cell
-def _(hv, np):
-    # Bokeh (holoviews' backend here) has no native polar coordinate system,
-    # so each rose is built from Cartesian annular-wedge polygons -- one per
-    # 16-sector x speed-bin combination. Data is tiny per rose (16 sectors x
-    # 8 speed bins x 4 seasons) so no resampling is needed here.
-    CALM_THRESHOLD = (
-        1.0  # m/s; shown as a single number in the center of each rose
-    )
+def _(np):
+    # Vega-Lite's arc mark has a native polar coordinate system (theta/radius),
+    # so each rose's petals are plain annular wedges -- one row per 16-sector x
+    # speed-bin combination -- rather than hand-built Cartesian polygons.
+    CALM_THRESHOLD = 1.0  # m/s; shown as a single number in the center of each rose
     # Bin edges chosen from the data's own distribution (99% of readings fall under
     # 19 m/s, max ~29 m/s), colored with the blue -> green -> yellow -> orange -> red
     # -> magenta progression used by windy.com / earth.nullschool-style wind speed
@@ -415,14 +399,9 @@ def _(hv, np):
     NSEC = 16
     COMPASS8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
-    def _annular_wedge(theta0, theta1, r_lo, r_hi, n=6):
-        outer = np.linspace(theta0, theta1, n)
-        inner = outer[::-1]
-        xs = np.concatenate([r_hi * np.cos(outer), r_lo * np.cos(inner)])
-        ys = np.concatenate([r_hi * np.sin(outer), r_lo * np.sin(inner)])
-        return xs, ys
-
-    def wind_rose(dirs, speeds, weights, title, max_r):
+    def wind_rose_wedges(dirs, speeds, weights, season, max_r):
+        """One row per (sector, speed bin) with non-zero frequency, in Vega-Lite's
+        theta convention (0 rad = N/12 o'clock, increasing clockwise)."""
         total_w = weights.sum()
         calm = speeds < CALM_THRESHOLD
         calm_pct = weights[calm].sum() / total_w * 100
@@ -441,126 +420,51 @@ def _(hv, np):
         # petals start outside a small blank center "hole" (standard wind-rose
         # convention) that displays the calm % without overlapping any wedge
         hole_r = max_r * 0.14
-        polys = []
+        rows = []
         for i in range(NSEC):
             c0, c1 = edges_deg[i], edges_deg[i + 1]
-            m0, m1 = np.radians(90 - c1), np.radians(90 - c0)
             r_lo = hole_r
             for k, label in enumerate(SPEED_LABELS):
                 r_hi = r_lo + freq[i, k]
                 if freq[i, k] > 0:
-                    xs, ys = _annular_wedge(m0, m1, r_lo, r_hi)
-                    polys.append(
+                    rows.append(
                         {
-                            "x": xs,
-                            "y": ys,
-                            "speed (m/s)": label,
+                            "season": season,
+                            "theta0": np.radians(c0),
+                            "theta1": np.radians(c1),
+                            "r0": r_lo,
+                            "r1": r_hi,
+                            "speed_bin": label,
                             "pct": round(float(freq[i, k]), 2),
-                            "dir": f"{c0:.0f}-{c1:.0f}",
+                            "dir": f"{c0:.0f}°–{c1:.0f}°",
                         }
                     )
                 r_lo = r_hi
-        ring_step = max(1, round(max_r / 4))
-        rings_r = np.arange(ring_step, max_r + hole_r + ring_step, ring_step)
-        wedges = hv.Polygons(polys, vdims=["speed (m/s)", "pct", "dir"]).opts(
-            color="speed (m/s)",
-            cmap=SPEED_COLORS,
-            line_color="white",
-            line_width=0.5,
-            tools=["hover"],
-            show_legend=False,
-            colorbar=False,
-        )
-        rings = hv.Path(
-            [hv.Ellipse(0, 0, 2 * r).array() for r in rings_r]
-        ).opts(color="gray", line_width=0.5, line_dash="dotted")
-        hole = hv.Ellipse(0, 0, 2 * hole_r).opts(
-            color="white", line_color="gray", line_width=0.75
-        )
-        # offset labels off the N gridline (and away from the center label) at a fixed compass bearing
-        _label_bearing = np.radians(90 - 22)
-        ring_labels = hv.Labels(
-            {
-                "x": rings_r * np.cos(_label_bearing),
-                "y": rings_r * np.sin(_label_bearing),
-                "text": [f"{r:g}%" for r in rings_r],
-            },
-            ["x", "y"],
-            "text",
-        ).opts(text_font_size="7pt", text_color="gray", text_align="left")
-        compass_r = (max_r + hole_r) * 1.1
-        cxs = compass_r * np.cos(np.radians(90 - np.arange(0, 360, 45)))
-        cys = compass_r * np.sin(np.radians(90 - np.arange(0, 360, 45)))
-        compass = hv.Labels(
-            {"x": cxs, "y": cys, "text": COMPASS8}, ["x", "y"], "text"
-        ).opts(text_font_size="9pt", text_color="gray")
-        center = hv.Labels(
-            {"x": [0], "y": [0], "text": [f"{calm_pct:.1f}% calm"]},
-            ["x", "y"],
-            "text",
-        ).opts(
-            text_font_size="7pt",
-            text_color="dimgray",
-            text_align="center",
-            text_baseline="middle",
-        )
-        lim = (max_r + hole_r) * 1.22
-        return (rings * wedges * hole * ring_labels * compass * center).opts(
-            width=340,
-            height=340,
-            xaxis=None,
-            yaxis=None,
-            show_grid=False,
-            xlim=(-lim, lim),
-            ylim=(-lim, lim),
-            title=title,
-            data_aspect=1,
-        )
+        return rows, calm_pct, hole_r
 
-    def wind_rose_legend():
-        n = len(SPEED_LABELS)
-        swatch_data = [
-            (0, n - 1 - i - 0.35, 0.6, n - 1 - i + 0.35, label)
-            for i, label in enumerate(SPEED_LABELS)
-        ]
-        swatches = hv.Rectangles(swatch_data, vdims=["speed (m/s)"]).opts(
-            color="speed (m/s)",
-            cmap=SPEED_COLORS,
-            line_color=None,
-            show_legend=False,
-        )
-        labels = hv.Labels(
-            {
-                "x": [0.9] * n,
-                "y": [n - 1 - i for i in range(n)],
-                "text": SPEED_LABELS,
-            },
-            ["x", "y"],
-            "text",
-        ).opts(
-            text_font_size="9pt",
-            text_align="left",
-            text_baseline="middle",
-        )
-        title = hv.Text(0, n + 0.3, "Wind speed (m/s)").opts(
-            text_font_size="9pt", text_align="left", text_font_style="bold"
-        )
-        return (swatches * labels * title).opts(
-            width=230,
-            height=340,
-            xaxis=None,
-            yaxis=None,
-            show_grid=False,
-            toolbar=None,
-            xlim=(-0.4, 4.0),
-            ylim=(-0.8, n + 0.9),
-        )
-
-    return wind_rose, wind_rose_legend
+    return (
+        CALM_THRESHOLD,
+        COMPASS8,
+        NSEC,
+        SPEED_BINS,
+        SPEED_COLORS,
+        SPEED_LABELS,
+        wind_rose_wedges,
+    )
 
 
 @app.cell
-def _(SEASON_ORDER, d, hv, np, pl, wind_rose, wind_rose_legend):
+def _(
+    COMPASS8,
+    SEASON_ORDER,
+    SPEED_COLORS,
+    SPEED_LABELS,
+    alt,
+    d,
+    np,
+    pl,
+    wind_rose_wedges,
+):
     _season_data = {}
     for _s in SEASON_ORDER:
         _sub = d.filter(
@@ -583,20 +487,121 @@ def _(SEASON_ORDER, d, hv, np, pl, wind_rose, wind_rose_legend):
         np.add.at(totals, sector, weights)
         return (totals / weights.sum() * 100).max()
 
-    _max_r = (
-        max(_max_freq(*v) for v in _season_data.values())
-        if _season_data
-        else 10.0
-    )
-    _roses = [
-        wind_rose(*_season_data[_s], _s, _max_r)
-        for _s in SEASON_ORDER
-        if _s in _season_data
+    _max_r = max(_max_freq(*v) for v in _season_data.values()) if _season_data else 10.0
+
+    _wedge_rows = []
+    _calm_rows = []
+    _hole_r = _max_r * 0.14
+    for _s in SEASON_ORDER:
+        if _s not in _season_data:
+            continue
+        _rows, _calm_pct, _hole_r = wind_rose_wedges(*_season_data[_s], _s, _max_r)
+        _wedge_rows.extend(_rows)
+        _calm_rows.append({"season": _s, "text": f"{_calm_pct:.1f}% calm"})
+
+    _ring_step = max(1, round(_max_r / 4))
+    _rings_r = np.arange(_ring_step, _max_r + _hole_r + _ring_step, _ring_step)
+    _ring_rows = [
+        {"season": _s, "r0": float(_r), "r1": float(_r), "text": f"{_r:g}%"}
+        for _s in _season_data
+        for _r in _rings_r
     ]
-    # 3 columns so the legend lands in the upper right: [winter, spring, legend] / [summer, fall]
-    _panels = _roses[:2] + [wind_rose_legend()] + _roses[2:]
-    hv.Layout(_panels).cols(3).opts(
-        title="Wind direction by season (time-weighted; 0°=N, clockwise)"
+    _compass_r = (_max_r + _hole_r) * 1.1
+    _compass_rows = [
+        {
+            "season": _s,
+            "theta": np.radians(_deg),
+            "r": _compass_r,
+            "text": _label,
+        }
+        for _s in _season_data
+        for _deg, _label in zip(range(0, 360, 45), COMPASS8)
+    ]
+    _hole_rows = [{"season": _s, "r0": 0.0, "r1": _hole_r} for _s in _season_data]
+
+    _wedges_df = pl.DataFrame(_wedge_rows)
+    _calm_df = pl.DataFrame(_calm_rows)
+    _ring_df = pl.DataFrame(_ring_rows)
+    _compass_df = pl.DataFrame(_compass_rows)
+    _hole_df = pl.DataFrame(_hole_rows)
+
+    _lim = (_max_r + _hole_r) * 1.28
+    _theta_scale = alt.Scale(domain=[0, 2 * np.pi], range=[0, 2 * np.pi], nice=False)
+    _radius_scale = alt.Scale(domain=[0, _lim], range=[0, 100], nice=False, zero=True)
+
+    _wedges = (
+        alt.Chart(_wedges_df)
+        .mark_arc(stroke="white", strokeWidth=0.5)
+        .encode(
+            theta=alt.Theta("theta0:Q", scale=_theta_scale),
+            theta2="theta1:Q",
+            radius=alt.Radius("r1:Q", scale=_radius_scale),
+            radius2=alt.Radius2("r0:Q"),
+            color=alt.Color(
+                "speed_bin:N",
+                scale=alt.Scale(
+                    domain=SPEED_LABELS,
+                    range=[SPEED_COLORS[_l] for _l in SPEED_LABELS],
+                ),
+                legend=alt.Legend(title="wind speed (m/s)"),
+            ),
+            tooltip=["season", "dir", "speed_bin", "pct"],
+        )
+    )
+    _rings = (
+        alt.Chart(_ring_df)
+        .mark_arc(fill=None, stroke="#999999", strokeDash=[2, 2], strokeWidth=1)
+        .encode(
+            theta=alt.value(0),
+            theta2=alt.value(2 * np.pi),
+            radius=alt.Radius("r1:Q", scale=_radius_scale),
+            radius2=alt.Radius2("r0:Q"),
+        )
+    )
+    _hole = (
+        alt.Chart(_hole_df)
+        .mark_arc(fill="white", stroke="gray", strokeWidth=0.75)
+        .encode(
+            theta=alt.value(0),
+            theta2=alt.value(2 * np.pi),
+            radius=alt.Radius("r1:Q", scale=_radius_scale),
+            radius2=alt.Radius2("r0:Q"),
+        )
+    )
+    _ring_labels = (
+        alt.Chart(_ring_df)
+        .mark_text(color="gray", fontSize=7, align="left", dx=2)
+        .encode(
+            theta=alt.value(np.radians(22)),
+            radius=alt.Radius("r1:Q", scale=_radius_scale),
+            text="text:N",
+        )
+    )
+    _compass = (
+        alt.Chart(_compass_df)
+        .mark_text(color="#666666", fontSize=9)
+        .encode(
+            theta=alt.Theta("theta:Q", scale=_theta_scale),
+            radius=alt.Radius("r:Q", scale=_radius_scale),
+            text="text:N",
+        )
+    )
+    _center = (
+        alt.Chart(_calm_df)
+        .mark_text(color="dimgray", fontSize=7, align="center", baseline="middle")
+        .encode(theta=alt.value(0), radius=alt.value(0), text="text:N")
+    )
+
+    (
+        alt.layer(_rings, _wedges, _hole, _ring_labels, _compass, _center)
+        .properties(width=220, height=220)
+        .facet(
+            column=alt.Column("season:N", sort=SEASON_ORDER, title=None),
+            data=_wedges_df,
+        )
+        .resolve_scale(radius="shared", theta="shared")
+        .properties(title="Wind direction by season (time-weighted; 0°=N, clockwise)")
+        .configure_view(stroke=None)
     )
     return
 
@@ -721,9 +726,7 @@ def _(Path, df, event_threshold, marimo, math, min_duration, np, pl):
                         "end": str(_t[j]),
                         "duration_min": round(float(dur_min), 1),
                         "peak_m_s": round(float(np.nanmax(_v[_i : j + 1])), 2),
-                        "mean_m_s": round(
-                            float(np.nanmean(_v[_i : j + 1])), 2
-                        ),
+                        "mean_m_s": round(float(np.nanmean(_v[_i : j + 1])), 2),
                         "mean_dir_deg": round(circular_mean(seg_dir), 1)
                         if np.isfinite(seg_dir).any()
                         else None,
