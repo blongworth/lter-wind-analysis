@@ -1,9 +1,3 @@
-# /// script
-# requires-python = ">=3.14"
-# dependencies = [
-#     "marimo>=0.24.0",
-# ]
-# ///
 import marimo
 
 __generated_with = "0.24.0"
@@ -122,11 +116,7 @@ def _(df, marimo):
 @app.cell
 def _(df, pl, season):
     # Working frame restricted to the selected season.
-    d = (
-        df
-        if season.value == "all"
-        else df.filter(pl.col("season") == season.value)
-    )
+    d = df if season.value == "all" else df.filter(pl.col("season") == season.value)
     return (d,)
 
 
@@ -159,11 +149,7 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
     _edges = np.linspace(0, max(d["wind_speed_m_s"].max(), x.value), 81)
     _hists = []
     for _s in SEASON_ORDER:
-        _v = (
-            d.filter(pl.col("season") == _s)["wind_speed_m_s"]
-            .drop_nulls()
-            .to_numpy()
-        )
+        _v = d.filter(pl.col("season") == _s)["wind_speed_m_s"].drop_nulls().to_numpy()
         if len(_v):
             _counts, _ = np.histogram(_v, bins=_edges, density=True)
             _hists.append(
@@ -228,9 +214,7 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
         )
         _fracs[_s] = _w[_v >= x.value].sum() / _total * 100
     # threshold answers as a text block next to the legend instead of scattered on the curves
-    _note = "\n".join(
-        f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs
-    )
+    _note = "\n".join(f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs)
     _note_label = hv.Labels(
         {"x": [_grid[-1] * 0.97], "y": [62], "text": [_note]},
         ["x", "y"],
@@ -277,9 +261,7 @@ def _(d, marimo, pl, x):
                     "hours": round(_t / 3600, 1),
                     "readings": len(_sub),
                     "% time >= x": round(
-                        _sub.filter(pl.col("wind_speed_m_s") >= x.value)[
-                            "dt_s"
-                        ].sum()
+                        _sub.filter(pl.col("wind_speed_m_s") >= x.value)["dt_s"].sum()
                         / _t
                         * 100,
                         2,
@@ -327,9 +309,7 @@ def _(COLORS, d, hv, marimo, pl, x):
                 "season": _sub["season"][0],
                 "hours": round(_t / 3600, 1),
                 "% above x": round(
-                    _sub.filter(pl.col("wind_speed_m_s") >= x.value)[
-                        "dt_s"
-                    ].sum()
+                    _sub.filter(pl.col("wind_speed_m_s") >= x.value)["dt_s"].sum()
                     / _t
                     * 100,
                     2,
@@ -382,9 +362,7 @@ def _(hv, np):
     # so each rose is built from Cartesian annular-wedge polygons -- one per
     # 16-sector x speed-bin combination. Data is tiny per rose (16 sectors x
     # 8 speed bins x 4 seasons) so no resampling is needed here.
-    CALM_THRESHOLD = (
-        1.0  # m/s; shown as a single number in the center of each rose
-    )
+    CALM_THRESHOLD = 1.0  # m/s; shown as a single number in the center of each rose
     # Bin edges chosen from the data's own distribution (99% of readings fall under
     # 19 m/s, max ~29 m/s), colored with the blue -> green -> yellow -> orange -> red
     # -> magenta progression used by windy.com / earth.nullschool-style wind speed
@@ -471,9 +449,9 @@ def _(hv, np):
             show_legend=False,
             colorbar=False,
         )
-        rings = hv.Path(
-            [hv.Ellipse(0, 0, 2 * r).array() for r in rings_r]
-        ).opts(color="gray", line_width=0.5, line_dash="dotted")
+        rings = hv.Path([hv.Ellipse(0, 0, 2 * r).array() for r in rings_r]).opts(
+            color="gray", line_width=0.5, line_dash="dotted"
+        )
         hole = hv.Ellipse(0, 0, 2 * hole_r).opts(
             color="white", line_color="gray", line_width=0.75
         )
@@ -583,11 +561,7 @@ def _(SEASON_ORDER, d, hv, np, pl, wind_rose, wind_rose_legend):
         np.add.at(totals, sector, weights)
         return (totals / weights.sum() * 100).max()
 
-    _max_r = (
-        max(_max_freq(*v) for v in _season_data.values())
-        if _season_data
-        else 10.0
-    )
+    _max_r = max(_max_freq(*v) for v in _season_data.values()) if _season_data else 10.0
     _roses = [
         wind_rose(*_season_data[_s], _s, _max_r)
         for _s in SEASON_ORDER
@@ -721,9 +695,7 @@ def _(Path, df, event_threshold, marimo, math, min_duration, np, pl):
                         "end": str(_t[j]),
                         "duration_min": round(float(dur_min), 1),
                         "peak_m_s": round(float(np.nanmax(_v[_i : j + 1])), 2),
-                        "mean_m_s": round(
-                            float(np.nanmean(_v[_i : j + 1])), 2
-                        ),
+                        "mean_m_s": round(float(np.nanmean(_v[_i : j + 1])), 2),
                         "mean_dir_deg": round(circular_mean(seg_dir), 1)
                         if np.isfinite(seg_dir).any()
                         else None,

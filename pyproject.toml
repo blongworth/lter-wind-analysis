@@ -1,7 +1,7 @@
 [project]
 name = "lter-wind-analysis"
 version = "0.1.0"
-description = "Add your description here"
+description = "Seasonal wind speed and direction statistics from NES-LTER underway shipboard data"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
