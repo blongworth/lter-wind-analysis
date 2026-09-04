@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#     "marimo>=0.24.0",
+# ]
+# ///
 import marimo
 
 __generated_with = "0.24.0"
@@ -129,46 +135,59 @@ def _():
         "summer": "#e4a72c",
         "fall": "#b8629b",
     }
-    return COLORS, SEASON_ORDER
+    HIGHLIGHT_CRUISE = "HRS2609"
+    HIGHLIGHT_COLOR = "#666666"
+    return COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER
 
 
 @app.cell
 def _(marimo):
     marimo.md(
-        "### 1. Wind speed distribution by season\n\nNormalized (density) histograms overlaid by season, with the threshold **x** marked."
+        "### 1. Wind speed distribution by season\n\nNormalized (density) histograms overlaid by season, with the threshold **x** marked. A final panel isolates cruise HRS2609."
     )
     return
 
 
 @app.cell
-def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
+def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl, x):
     # Pre-bin with numpy instead of handing raw per-reading arrays to the plot:
     # a density histogram only ever needs the bin counts, so this is the
     # "resampling" step for this chart and keeps the payload tiny regardless
     # of how many hundreds of thousands of readings are behind it.
     _edges = np.linspace(0, max(d["wind_speed_m_s"].max(), x.value), 81)
-    _hists = []
+
+    def _panel(_v, _label, _color):
+        _counts, _ = np.histogram(_v, bins=_edges, density=True)
+        _hist = hv.Histogram((_edges, _counts), label=_label).opts(
+            fill_color=_color, fill_alpha=0.45, line_alpha=0
+        )
+        return (_hist * hv.VLine(x.value).opts(color="red", line_dash="dashed")).opts(
+            hv.opts.Overlay(
+                width=700,
+                height=150,
+                xlabel="wind speed (m/s)",
+                ylabel="density",
+                show_legend=True,
+                legend_position="top_right",
+            )
+        )
+
+    _panels = []
     for _s in SEASON_ORDER:
         _v = d.filter(pl.col("season") == _s)["wind_speed_m_s"].drop_nulls().to_numpy()
         if len(_v):
-            _counts, _ = np.histogram(_v, bins=_edges, density=True)
-            _hists.append(
-                hv.Histogram((_edges, _counts), label=_s).opts(
-                    fill_color=COLORS[_s], fill_alpha=0.45, line_alpha=0
-                )
-            )
-    _overlay = hv.Overlay(_hists) * hv.VLine(x.value).opts(
-        color="red", line_dash="dashed"
+            _panels.append(_panel(_v, _s, COLORS[_s]))
+    # HRS2609 pulled from the full (season-unfiltered) dataset, since it's a
+    # single cruise and the season dropdown shouldn't hide it.
+    _hrs_v = (
+        df.filter(pl.col("cruise") == HIGHLIGHT_CRUISE)["wind_speed_m_s"]
+        .drop_nulls()
+        .to_numpy()
     )
-    _overlay.opts(
-        hv.opts.Overlay(
-            width=700,
-            height=400,
-            title="Underway true-wind speed distribution by season (density)",
-            xlabel="wind speed (m/s)",
-            ylabel="density",
-            legend_position="top_right",
-        ),
+    if len(_hrs_v):
+        _panels.append(_panel(_hrs_v, HIGHLIGHT_CRUISE, HIGHLIGHT_COLOR))
+    hv.Layout(_panels).cols(1).opts(
+        title="Underway true-wind speed distribution by season (density)"
     )
     return
 
@@ -176,13 +195,13 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
 @app.cell
 def _(marimo):
     marimo.md(
-        '### 1b. "What percentage of the time is wind above x?" — survival curves\n\nS(v) = time-weighted P(wind > v) per season. The red dashed line marks **x**; the text next to the legend gives each season\'s answer at that x.'
+        '### 1b. "What percentage of the time is wind above x?" — survival curves\n\nS(v) = time-weighted P(wind > v) per season, plus a separate line for cruise HRS2609. The red dashed line marks **x**; the text next to the legend gives each series\' answer at that x.'
     )
     return
 
 
 @app.cell
-def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
+def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl, x):
     # Each season's exact survival function has one point per underway reading
     # (up to ~10^5-10^6) and looks jagged at that resolution. Interpolating it
     # onto a shared 300-point grid is this chart's resampling step: tiny
@@ -191,15 +210,15 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
     _grid = np.linspace(0, max(d["wind_speed_m_s"].max(), x.value), 300)
     _curves = []
     _fracs = {}
-    for _s in SEASON_ORDER:
-        _sub = d.filter(pl.col("season") == _s).drop_nulls("wind_speed_m_s")
+
+    def _survival(_sub, _label, _color):
         (_v, _w) = (
             _sub["wind_speed_m_s"].to_numpy(),
             _sub["dt_s"].to_numpy(),
         )
         _total = _w.sum()
         if len(_v) < 10 or _total <= 0:
-            continue
+            return
         _order = np.argsort(_v)
         (_v, _w) = (_v[_order], _w[_order])
         _above = np.cumsum(_w[::-1])[::-1] / _total * 100
@@ -209,12 +228,23 @@ def _(COLORS, SEASON_ORDER, d, hv, np, pl, x):
                 (_grid, _smooth),
                 "wind speed (m/s)",
                 "% of time with wind above v",
-                label=_s,
-            ).opts(color=COLORS[_s], line_width=2)
+                label=_label,
+            ).opts(color=_color, line_width=2)
         )
-        _fracs[_s] = _w[_v >= x.value].sum() / _total * 100
+        _fracs[_label] = _w[_v >= x.value].sum() / _total * 100
+
+    for _s in SEASON_ORDER:
+        _survival(d.filter(pl.col("season") == _s).drop_nulls("wind_speed_m_s"), _s, COLORS[_s])
+    # HRS2609 pulled from the full (season-unfiltered) dataset, since it's a
+    # single cruise and the season dropdown shouldn't hide it.
+    _survival(
+        df.filter(pl.col("cruise") == HIGHLIGHT_CRUISE).drop_nulls("wind_speed_m_s"),
+        HIGHLIGHT_CRUISE,
+        HIGHLIGHT_COLOR,
+    )
     # threshold answers as a text block next to the legend instead of scattered on the curves
-    _note = "\n".join(f"{_s}: {_fracs[_s]:.1f}%" for _s in SEASON_ORDER if _s in _fracs)
+    _labels_order = SEASON_ORDER + [HIGHLIGHT_CRUISE]
+    _note = "\n".join(f"{_l}: {_fracs[_l]:.1f}%" for _l in _labels_order if _l in _fracs)
     _note_label = hv.Labels(
         {"x": [_grid[-1] * 0.97], "y": [62], "text": [_note]},
         ["x", "y"],
