@@ -1,9 +1,3 @@
-# /// script
-# requires-python = ">=3.14"
-# dependencies = [
-#     "marimo>=0.24.0",
-# ]
-# ///
 import marimo
 
 __generated_with = "0.24.0"
@@ -234,7 +228,11 @@ def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl
         _fracs[_label] = _w[_v >= x.value].sum() / _total * 100
 
     for _s in SEASON_ORDER:
-        _survival(d.filter(pl.col("season") == _s).drop_nulls("wind_speed_m_s"), _s, COLORS[_s])
+        _survival(
+            d.filter(pl.col("season") == _s).drop_nulls("wind_speed_m_s"),
+            _s,
+            COLORS[_s],
+        )
     # HRS2609 pulled from the full (season-unfiltered) dataset, since it's a
     # single cruise and the season dropdown shouldn't hide it.
     _survival(
@@ -242,16 +240,22 @@ def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl
         HIGHLIGHT_CRUISE,
         HIGHLIGHT_COLOR,
     )
-    # threshold answers as a text block next to the legend instead of scattered on the curves
+    # Threshold answers as a text block in the bottom-right corner, where the
+    # curves themselves converge toward 0% (v is near its max) and the
+    # top-right legend never reaches -- unlike a fixed y anchored near the
+    # top, this stays clear of the legend regardless of how many series
+    # (seasons + HRS2609) are listed.
     _labels_order = SEASON_ORDER + [HIGHLIGHT_CRUISE]
-    _note = "\n".join(f"{_l}: {_fracs[_l]:.1f}%" for _l in _labels_order if _l in _fracs)
+    _note = "\n".join(
+        f"{_l}: {_fracs[_l]:.1f}%" for _l in _labels_order if _l in _fracs
+    )
     _note_label = hv.Labels(
-        {"x": [_grid[-1] * 0.97], "y": [62], "text": [_note]},
+        {"x": [_grid[-1] * 0.97], "y": [3], "text": [_note]},
         ["x", "y"],
         "text",
     ).opts(
         text_align="right",
-        text_baseline="top",
+        text_baseline="bottom",
         text_font_size="9pt",
         text_color="dimgray",
     )
