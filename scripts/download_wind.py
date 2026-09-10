@@ -6,8 +6,12 @@ Data source
 NES-LTER API (https://nes-lter-api.whoi.edu), endpoint
 ``/api/underway/{cruise}.csv`` — the same endpoint the ``nes-lter-mcp`` MCP
 server (``query_underway`` / ``list_dataset_rows``) uses. The per-vessel
-column resolution below mirrors the server's ``UNDERWAY_VARIABLE_ALIASES``
-table, which was discovered/verified via the MCP tool ``resolve_variable``.
+column resolution below started from that server's
+``UNDERWAY_VARIABLE_ALIASES`` table but now deliberately diverges from it: see
+the Endeavor knots conversion and, more significantly, the Armstrong/Atlantis
+true-vs-relative column choice, both documented inline in ``WIND_ALIASES``.
+Column semantics are checked against ``/api/underway/column_definition/``
+rather than guessed from column names.
 
 Outputs
 -------
@@ -31,6 +35,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import sys
 import time
 import urllib.request
@@ -83,25 +88,46 @@ WIND_ALIASES: dict[str, VesselWindConfig] = {
         "lon": ["gps_furuno_longitude"],
     },
     "armstrong": {
-        "speed": [("wxtp_sm", 1.0), ("wxts_sm", 1.0)],
-        # wxtp_dm/wxts_dm are relative to the bow, not true/absolute compass
-        # bearings: verified across AR16/AR62/AT46 by comparing direction
-        # stability during heading changes -- wxtp_dm alone shifts almost in
-        # lockstep with heading (regression slope ~-0.7, median |delta| 31-42
-        # deg during >10 deg heading changes), while (wxtp_dm + heading) is
-        # far more stable (median |delta| 8-13 deg), confirming heading is the
-        # correction needed to get true direction. See "direction_reference".
-        "direction": [("wxtp_dm", 1.0), ("wxts_dm", 1.0)],
-        "direction_reference": "relative_to_bow",
-        "heading": [("hdt", 1.0)],
+        # The Vaisala WXT units report BOTH relative and true wind, and this
+        # pipeline previously published the relative pair (wxtp_sm/wxtp_dm) as
+        # true wind. The API's own column_definition endpoint settles it:
+        #
+        #   WXTP_Sm | "Port Vaisala relative wind speed average" | m/s
+        #   WXTP_Dm | "Port Vaisala relative wind direction average" | degrees
+        #   WXTP_TS | "Port Vaisala True Wind Speed" | m/s
+        #   WXTP_TD | "Port Vaisala True Wind Direction" | degrees
+        #
+        # so _ts/_td are the correct columns and need no heading correction.
+        # Confirmed present on all 49 Armstrong/Atlantis cruises (including
+        # AT46) via /api/underway/get_column_headers. On AR39B the old
+        # published value (wxtp_sm) vs wxtp_ts has ratio p50 1.000 but p5 0.625
+        # / p95 1.885 -- equal only while on station, diverging under way,
+        # which is the signature of apparent wind. Units are m/s per the
+        # definitions above, hence factor 1.0 (these are NOT knots).
+        "speed": [("wxtp_ts", 1.0), ("wxts_ts", 1.0)],
+        "direction": [("wxtp_td", 1.0), ("wxts_td", 1.0)],
         "lat": ["dec_lat"],
         "lon": ["dec_lon"],
     },
     "sharp": {
-        "speed": [("wind1_true_speed_kt", KT_TO_MS), ("wind2_true_speed_kt", KT_TO_MS)],
-        "direction": [("wind1_true_dir_deg", 1.0), ("wind2_true_dir_deg", 1.0)],
-        "lat": ["dec_lat"],
-        "lon": ["dec_lon"],
+        # Two naming eras. HRS26xx use wind1/wind2_true_*; HRS2303 (2023) uses
+        # true_wind_speed__knots (yes, a double underscore) and
+        # true_wind_direction_deg, and was previously excluded outright because
+        # neither spelling was listed here. Both eras report knots.
+        "speed": [
+            ("wind1_true_speed_kt", KT_TO_MS),
+            ("wind2_true_speed_kt", KT_TO_MS),
+            ("true_wind_speed__knots", KT_TO_MS),
+            ("true_wind_speed_knots", KT_TO_MS),
+        ],
+        "direction": [
+            ("wind1_true_dir_deg", 1.0),
+            ("wind2_true_dir_deg", 1.0),
+            ("true_wind_direction_deg", 1.0),
+        ],
+        # HRS2303 names its position columns latitude_deg/longitude_deg.
+        "lat": ["dec_lat", "latitude_deg"],
+        "lon": ["dec_lon", "longitude_deg"],
     },
     "atlantic_explorer": {
         "speed": [
@@ -127,10 +153,14 @@ MISSING = {
     "null",
     "none",
     "missing",
-    "-999",
-    "-999.0",
-    "-9999",
 }
+
+# Applied after float conversion rather than as strings, so -99, -99.0, -99.00
+# and -9.9e1 all die by the same rule. HRS2303 uses -99 where other feeds use
+# -999/-9999; matching on the string spelling alone missed it. None of these
+# are physical for the five variables this script emits (speed, direction,
+# lat, lon) -- this rule is scoped to those, not a general-purpose filter.
+SENTINEL_NUMERICS = {-9999.0, -999.0, -99.0, 999.0, 9999.0}
 
 
 def fetch(url: str, retries: int = 3) -> bytes:
@@ -163,10 +193,27 @@ def first_float(row: dict, candidates: list[str]) -> float | None:
         if v.lower() in MISSING:
             continue
         try:
-            return float(v)
+            f = float(v)
         except ValueError:
             continue
+        if not math.isfinite(f) or f in SENTINEL_NUMERICS:
+            continue
+        return f
     return None
+
+
+def valid_direction(wd: float | None) -> float | None:
+    """Degrees from north, or None. Guards against sentinels reaching the output."""
+    if wd is None or not (0 <= wd <= 360):
+        return None
+    return wd % 360
+
+
+def valid_position(lat: float | None, lon: float | None) -> tuple[float | None, float | None]:
+    """Drop implausible fixes as a pair -- half a position is not useful."""
+    if lat is None or lon is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return None, None
+    return lat, lon
 
 
 def resolve(
@@ -203,7 +250,9 @@ def main() -> None:
             "start_time": c.get("start_time"),
             "end_time": c.get("end_time"),
             "season": None,
+            "n_feed_rows": 0,
             "n_wind_readings": 0,
+            "n_duplicates_dropped": 0,
             "wind_speed_col": None,
             "wind_dir_col": None,
             "heading_col": None,
@@ -281,12 +330,14 @@ def main() -> None:
             ws *= speed[1]
             if not (0 <= ws < 100):
                 continue
-            wd = first_float(row, [direction[0]])
+            wd = valid_direction(first_float(row, [direction[0]]))
             if wd is not None and heading is not None:
                 hdg = first_float(row, [heading[0]])
-                wd = (wd + hdg) % 360 if hdg is not None else None
-            lat = first_float(row, WIND_ALIASES[family]["lat"])
-            lon = first_float(row, WIND_ALIASES[family]["lon"])
+                wd = valid_direction(wd + hdg) if hdg is not None else None
+            lat, lon = valid_position(
+                first_float(row, WIND_ALIASES[family]["lat"]),
+                first_float(row, WIND_ALIASES[family]["lon"]),
+            )
             per_cruise.append(
                 {
                     "date": (row.get("date") or "").strip(),
@@ -294,11 +345,15 @@ def main() -> None:
                     "vessel": vessel,
                     "season": record["season"],
                     "wind_speed_m_s": round(ws, 4),
-                    "wind_dir_deg": round(wd, 1) if wd is not None else None,
+                    # Re-wrap after rounding: 359.96 rounds to 360.0, which is
+                    # outside the half-open [0, 360) the rest of the project
+                    # (and the wind-rose sector binning) assumes.
+                    "wind_dir_deg": round(wd, 1) % 360 if wd is not None else None,
                     "lat": round(lat, 4) if lat is not None else None,
                     "lon": round(lon, 4) if lon is not None else None,
                 }
             )
+        record["n_feed_rows"] = n_rows
         record["n_wind_readings"] = len(per_cruise)
         if not per_cruise:
             record["status"] = "no_wind_data"
@@ -315,11 +370,31 @@ def main() -> None:
                 .str.to_datetime(strict=False, time_zone="UTC")
                 .dt.replace_time_zone(None)
             )
+            # Drop exact duplicate readings. The API has been observed serving a
+            # doubled file (HRS2607 once came back as 4,726 distinct rows
+            # repeated twice); it currently does not, so this is a standing
+            # guard against recurrence rather than a one-time cleanup -- do not
+            # remove it just because a run reports zero. Keyed on the whole
+            # value tuple, never on 'date' alone: two rows sharing a timestamp
+            # but carrying different values are real samples, and collapsing
+            # them would be the same class of silent data loss this guards against.
+            before = len(cruise_df)
+            cruise_df = cruise_df.unique(keep="first", maintain_order=True)
+            record["n_duplicates_dropped"] = before - len(cruise_df)
+            record["n_wind_readings"] = len(cruise_df)
+            if record["n_duplicates_dropped"]:
+                record["notes"].append(
+                    f"dropped {record['n_duplicates_dropped']} exact duplicate readings"
+                )
             cruise_df.write_parquet(raw_dir / f"{name}.parquet")
             wind_frames.append(cruise_df)
-            n_wind_readings += len(per_cruise)
+            n_wind_readings += len(cruise_df)
         cruise_records.append(record)
-        print(f"    rows={n_rows}, wind readings={len(per_cruise)}")
+        dupes = record["n_duplicates_dropped"]
+        print(
+            f"    rows={n_rows}, wind readings={record['n_wind_readings']}"
+            + (f" (dropped {dupes} duplicates)" if dupes else "")
+        )
 
     # combined processed file
     if wind_frames:
@@ -337,48 +412,73 @@ def main() -> None:
             "api_base": API,
             "cruise_catalog_endpoint": "/api/ctd/cruises/all",
             "underway_csv_endpoint": "/api/underway/{cruise}.csv",
-            "mcp": "Columns and endpoints were located via the nes-lter-mcp MCP server "
-            "(tools: find_cruises, query_underway, get_dataset_schema, resolve_variable). "
-            "Vessel->column mapping mirrors that server's UNDERWAY_VARIABLE_ALIASES, except "
-            "two corrections that table does not have: the Endeavor speed conversion factor, "
-            "and the Armstrong/Atlantis direction-to-heading correction (see notes below).",
+            "column_definition_endpoint": "/api/underway/column_definition/{cruise}",
+            "column_headers_endpoint": "/api/underway/get_column_headers/{cruise}",
+            "mcp": "Columns and endpoints were originally located via the nes-lter-mcp MCP "
+            "server (tools: find_cruises, query_underway, get_dataset_schema, "
+            "resolve_variable). The vessel->column mapping no longer mirrors that server's "
+            "UNDERWAY_VARIABLE_ALIASES: it now diverges on the Endeavor speed conversion "
+            "factor and, more importantly, on which Armstrong/Atlantis columns are true "
+            "wind at all (see variables below). Column choices are now checked against the "
+            "API's own column_definition endpoint rather than inferred from column names.",
+            "catalog_completeness": "The cruise catalog (/api/ctd/cruises/all, 74 cruises) was "
+            "verified to be the complete underway universe by cross-checking the underway "
+            "file store (/api/underway/find/{start}/{end}), the per-year cruise index pages, "
+            "and the nutrient/chlorophyll datasets, plus negative-control probes of "
+            "plausible-but-unlisted cruise IDs (all 404). No underway-only cruises exist "
+            "outside this catalog.",
         },
         "variables": {
-            "wind_speed_m_s": "True wind speed at the bow anemometer, converted to m/s "
-            "(Sharp, Atlantic Explorer, and Endeavor sensors report knots; "
-            "the Endeavor unit was independently confirmed by reconstructing "
-            "true wind vectorially from relative wind + heading + ship speed "
-            "log, since the raw column name carries no unit and the MCP "
-            "server's own alias table assumes m/s incorrectly).",
-            "wind_dir_deg": "True wind direction, degrees from north (0-360). For Armstrong/"
-            "Atlantis, wxtp_dm/wxts_dm are relative to the bow (0=dead ahead, "
-            "clockwise), NOT true direction as their name suggests -- confirmed by "
-            "comparing direction stability during heading changes across AR16/AR62/"
-            "AT46 (raw value shifts almost in lockstep with heading, regression "
-            "slope ~-0.7-0.8; adding heading back in, i.e. (dm + hdt) % 360, cuts "
-            "the median instability from 31-42 deg to 8-13 deg during turns). The "
-            "MCP server's alias table has this same gap (uses dm directly with no "
-            "heading correction). This pipeline now corrects it using the true "
-            "heading column (hdt); cruises where hdt isn't available are excluded "
-            "rather than publishing uncorrected relative angles as absolute.",
+            "wind_speed_m_s": "True wind speed, m/s. Sharp, Atlantic Explorer, and Endeavor "
+            "sensors report knots and are converted; Armstrong/Atlantis wxtp_ts/wxts_ts are "
+            "already m/s per the API's column_definition. The Endeavor unit was "
+            "independently confirmed by reconstructing true wind vectorially from relative "
+            "wind + heading + ship speed log, since the raw column name carries no unit and "
+            "the MCP server's own alias table assumes m/s incorrectly.",
+            "wind_dir_deg": "True wind direction, degrees from north (0-360).",
+            "armstrong_column_correction": "Armstrong/Atlantis previously used wxtp_sm/wxtp_dm "
+            "with a (dm + hdt) % 360 heading correction. The API's column_definition "
+            "endpoint documents those as 'Port Vaisala relative wind speed/direction "
+            "average', while wxtp_ts/wxtp_td are 'Port Vaisala True Wind Speed/Direction' -- "
+            "so the published speed was apparent, not true. This pipeline now uses "
+            "wxtp_ts/wxtp_td (wxts_* as fallback), which are present on all 49 "
+            "Armstrong/Atlantis cruises and need no heading correction. On AR39B the old "
+            "and new speeds have ratio p50 1.000 but p5 0.625 / p95 1.885 -- identical only "
+            "while on station, diverging under way, as apparent wind does. Note the old "
+            "direction reconstruction was close to right: (dm + hdt) % 360 agrees with the "
+            "vendor's wxtp_td to a 1.4 deg median on AR39B, so this change affects speed far "
+            "more than direction.",
         },
-        "quality": "Rows with NODATA/NAN/missing sentinel values or non-physical speeds "
-        "(<0 or >=100 m/s) are dropped; no other QA applied. Only true wind is used; "
-        "cruises that only have relative wind are excluded (see cruise notes). "
-        "No gust de-spiking — a small number of very large readings remain and are "
-        "visible in the velocity distribution. "
-        "Armstrong/Atlantis (wxtp_sm/wxts_sm) speed and direction were independently "
-        "validated against OOI Pioneer Array METBK buoys (CP01CNSM, CP03ISSM, CP04OSSM -- "
-        "moored directly in the NES-LTER sampling area), which report wind in m/s with no "
-        "unit ambiguity. Matching ~72,600 Armstrong/Atlantis readings within 5 km and 10 "
-        "min of a buoy gives median ship/buoy speed ratio 1.27 and median direction error "
-        "7.7 deg; the same comparison for Endeavor (whose speed/units were separately "
-        "confirmed correct) gives ratio 1.23 and error 7.6 deg over ~8,400 matches -- "
-        "essentially identical, and consistent with ships' bow anemometers sitting well "
-        "above a buoy's ~3-4 m sensor (higher wind speed with height is expected, not an "
-        "error). This rules out both a m/s-vs-knots mislabeling and an uncorrected "
-        "apparent-wind contamination for Armstrong/Atlantis speed: had either been true, "
-        "its ratio would differ sharply from Endeavor's rather than closely tracking it.",
+        "quality": "Rows are dropped when speed is missing, non-finite, a sentinel, or "
+        "non-physical (<0 or >=100 m/s). Missing values are recognized both as strings "
+        "(NODATA/NAN/etc.) and numerically (-9999, -999, -99, 999, 9999) -- the numeric rule "
+        "matters because HRS2303 uses -99 where other feeds use -999. Direction outside "
+        "0-360 is nulled (the row is kept for its speed); positions outside physical "
+        "lat/lon range are nulled as a pair. Exact duplicate readings are dropped per cruise "
+        "(the API was once observed serving a doubled file for HRS2607); the dedup key is "
+        "the whole value tuple, never the timestamp alone. Only true wind is used; cruises "
+        "with only relative wind are excluded (see cruise notes). No gust de-spiking -- a "
+        "small number of very large readings remain and are visible in the velocity "
+        "distribution. "
+        "BUOY VALIDATION (re-run against the corrected columns; see "
+        "scripts/validate_buoys.py): matching ship readings to OOI Pioneer Array METBK "
+        "buoys (CP01CNSM, CP03ISSM, CP04OSSM) within 5 km and 10 min gives, for "
+        "Armstrong/Atlantis, median ship/buoy speed ratio 1.268 and median direction error "
+        "7.2 deg over 72,263 matches -- versus 1.273 and 7.9 deg for the same comparison "
+        "against the pre-correction (wxtp_sm/wxtp_dm) data. The Endeavor control is "
+        "unchanged at 1.227 and 7.6 deg over 8,778 matches. "
+        "IMPORTANT INTERPRETATION: the speed ratio barely moved, which does NOT vindicate "
+        "the old columns. The buoy-matched readings are precisely the ones least affected "
+        "by the correction -- near a mooring the correction shifts speed by a median of "
+        "0.20 m/s, versus 0.40 m/s over the dataset as a whole -- so this comparison has "
+        "roughly half the sensitivity to the true-vs-relative question and cannot "
+        "adjudicate it in either direction. That is also why the original validation "
+        "appeared to rule out apparent-wind contamination when it could not. The decisive "
+        "evidence for the column change is the API's own column_definition metadata, not "
+        "this comparison. What the re-run does show is that direction improved slightly "
+        "(7.9 -> 7.2 deg), and that the residual 1.27-vs-1.23 gap against Endeavor is now a "
+        "genuine inter-vessel difference (mast height and exposure) rather than "
+        "apparent-wind inflation.",
         "season_definition": "Cruise start month: winter={12,1,2}, spring={3,4,5}, summer={6,7,8}, fall={9,10,11} "
         "(same convention as the NES-LTER API / nes-lter-mcp find_cruises tool).",
         "cruises": cruise_records,
@@ -386,6 +486,10 @@ def main() -> None:
             "cruises_in_catalog": len(cruises),
             "cruises_with_wind": sum(1 for r in cruise_records if r["status"] == "ok"),
             "wind_readings": n_wind_readings,
+            "feed_rows": sum(r["n_feed_rows"] for r in cruise_records),
+            "duplicates_dropped": sum(
+                r["n_duplicates_dropped"] for r in cruise_records
+            ),
         },
     }
     with open(proc_dir / "provenance.json", "w") as f:
