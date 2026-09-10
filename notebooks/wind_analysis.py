@@ -95,6 +95,9 @@ def _(marimo):
 
     * **x** — threshold for the "above x" questions (m/s).
     * **Season** — restrict the distributions/analyses to one season (or all).
+    * **Cruise** — the single cruise highlighted alongside the seasonal series
+      in §1 and §1b, or "none" for a seasons-only view. Not affected by the
+      season filter.
     """)
     return
 
@@ -109,8 +112,19 @@ def _(df, marimo):
         value="all",
         label="season",
     )
-    marimo.hstack([x, season])
-    return season, x
+    # Highlighted cruise for sections 1 and 1b; "none" gives a seasons-only
+    # view. Defaults to HRS2609 when it's present, otherwise "none", so the
+    # notebook still runs against a dataset that predates (or postdates) that
+    # cruise.
+    _cruise_options = sorted(df["cruise"].drop_nulls().unique().to_list())
+    cruise = marimo.ui.dropdown(
+        options=["none"] + _cruise_options,
+        value="HRS2609" if "HRS2609" in _cruise_options else "none",
+        searchable=True,
+        label="highlight cruise",
+    )
+    marimo.hstack([x, season, cruise])
+    return cruise, season, x
 
 
 @app.cell
@@ -129,21 +143,25 @@ def _():
         "summer": "#e4a72c",
         "fall": "#b8629b",
     }
-    HIGHLIGHT_CRUISE = "HRS2609"
     HIGHLIGHT_COLOR = "#666666"
-    return COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER
+    return COLORS, HIGHLIGHT_COLOR, SEASON_ORDER
 
 
 @app.cell
-def _(marimo):
+def _(cruise, marimo):
+    _extra = (
+        ""
+        if cruise.value == "none"
+        else f" A final panel isolates cruise **{cruise.value}**."
+    )
     marimo.md(
-        "### 1. Wind speed distribution by season\n\nNormalized (density) histograms overlaid by season, with the threshold **x** marked. A final panel isolates cruise HRS2609."
+        f"### 1. Wind speed distribution by season\n\nNormalized (density) histograms overlaid by season, with the threshold **x** marked.{_extra}"
     )
     return
 
 
 @app.cell
-def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl, x):
+def _(COLORS, HIGHLIGHT_COLOR, SEASON_ORDER, cruise, d, df, hv, np, pl, x):
     # Pre-bin with numpy instead of handing raw per-reading arrays to the plot:
     # a density histogram only ever needs the bin counts, so this is the
     # "resampling" step for this chart and keeps the payload tiny regardless
@@ -171,15 +189,17 @@ def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl
         _v = d.filter(pl.col("season") == _s)["wind_speed_m_s"].drop_nulls().to_numpy()
         if len(_v):
             _panels.append(_panel(_v, _s, COLORS[_s]))
-    # HRS2609 pulled from the full (season-unfiltered) dataset, since it's a
-    # single cruise and the season dropdown shouldn't hide it.
-    _hrs_v = (
-        df.filter(pl.col("cruise") == HIGHLIGHT_CRUISE)["wind_speed_m_s"]
-        .drop_nulls()
-        .to_numpy()
-    )
-    if len(_hrs_v):
-        _panels.append(_panel(_hrs_v, HIGHLIGHT_CRUISE, HIGHLIGHT_COLOR))
+    # The highlighted cruise is pulled from the full (season-unfiltered)
+    # dataset, since it's a single cruise and the season dropdown shouldn't
+    # hide it.
+    if cruise.value != "none":
+        _cruise_v = (
+            df.filter(pl.col("cruise") == cruise.value)["wind_speed_m_s"]
+            .drop_nulls()
+            .to_numpy()
+        )
+        if len(_cruise_v):
+            _panels.append(_panel(_cruise_v, cruise.value, HIGHLIGHT_COLOR))
     hv.Layout(_panels).cols(1).opts(
         title="Underway true-wind speed distribution by season (density)"
     )
@@ -187,15 +207,20 @@ def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl
 
 
 @app.cell
-def _(marimo):
+def _(cruise, marimo):
+    _extra = (
+        ""
+        if cruise.value == "none"
+        else f", plus a separate line for cruise **{cruise.value}**"
+    )
     marimo.md(
-        '### 1b. "What percentage of the time is wind above x?" — survival curves\n\nS(v) = time-weighted P(wind > v) per season, plus a separate line for cruise HRS2609. The red dashed line marks **x**; the text next to the legend gives each series\' answer at that x.'
+        f'### 1b. "What percentage of the time is wind above x?" — survival curves\n\nS(v) = time-weighted P(wind > v) per season{_extra}. The red dashed line marks **x**; the text next to the legend gives each series\' answer at that x.'
     )
     return
 
 
 @app.cell
-def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl, x):
+def _(COLORS, HIGHLIGHT_COLOR, SEASON_ORDER, cruise, d, df, hv, np, pl, x):
     # Each season's exact survival function has one point per underway reading
     # (up to ~10^5-10^6) and looks jagged at that resolution. Interpolating it
     # onto a shared 300-point grid is this chart's resampling step: tiny
@@ -233,19 +258,21 @@ def _(COLORS, HIGHLIGHT_COLOR, HIGHLIGHT_CRUISE, SEASON_ORDER, d, df, hv, np, pl
             _s,
             COLORS[_s],
         )
-    # HRS2609 pulled from the full (season-unfiltered) dataset, since it's a
-    # single cruise and the season dropdown shouldn't hide it.
-    _survival(
-        df.filter(pl.col("cruise") == HIGHLIGHT_CRUISE).drop_nulls("wind_speed_m_s"),
-        HIGHLIGHT_CRUISE,
-        HIGHLIGHT_COLOR,
-    )
+    # The highlighted cruise is pulled from the full (season-unfiltered)
+    # dataset, since it's a single cruise and the season dropdown shouldn't
+    # hide it.
+    if cruise.value != "none":
+        _survival(
+            df.filter(pl.col("cruise") == cruise.value).drop_nulls("wind_speed_m_s"),
+            cruise.value,
+            HIGHLIGHT_COLOR,
+        )
     # Threshold answers as a text block in the bottom-right corner, where the
     # curves themselves converge toward 0% (v is near its max) and the
     # top-right legend never reaches -- unlike a fixed y anchored near the
     # top, this stays clear of the legend regardless of how many series
-    # (seasons + HRS2609) are listed.
-    _labels_order = SEASON_ORDER + [HIGHLIGHT_CRUISE]
+    # (seasons + the highlighted cruise) are listed.
+    _labels_order = SEASON_ORDER + ([] if cruise.value == "none" else [cruise.value])
     _note = "\n".join(
         f"{_l}: {_fracs[_l]:.1f}%" for _l in _labels_order if _l in _fracs
     )
