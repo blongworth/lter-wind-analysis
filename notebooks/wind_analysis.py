@@ -409,10 +409,22 @@ def _(marimo):
     strongest at the tip -- so both prevailing direction and how hard it
     typically blows from that direction are visible together. The % of time
     below 1 m/s ("calm", direction undefined at near-zero wind) is shown in
-    the center of each rose rather than assigned to a direction. All four
-    roses share one radial scale and one legend (upper right). Direction is
+    the center of each rose rather than assigned to a direction. Direction is
     true/absolute (not relative to the ship's heading; see provenance note
     below the roses).
+
+    The four **seasonal** roses share one radial scale, so their petal lengths
+    are directly comparable, and one legend (upper right). The fifth rose is
+    the **selected cruise**, which is drawn on its own radial scale: a single
+    cruise is a few days of one weather pattern rather than a climatology, so
+    its strongest sector typically runs about 20% of the time and can reach
+    50%, against 10-17% for a full season. Putting it on the shared scale
+    would shrink all four seasonal roses by up to 3x depending on which cruise
+    was picked. Instead, a **dashed ring** on the cruise rose marks the radius
+    the seasonal peak would reach on that rose's scale: petals crossing it mean
+    the cruise concentrated wind into one sector more strongly than any full
+    season does. Read the ring labels, not the raw petal lengths, when
+    comparing across that boundary.
     """)
     return
 
@@ -461,7 +473,7 @@ def _(hv, np):
         ys = np.concatenate([r_hi * np.sin(outer), r_lo * np.sin(inner)])
         return xs, ys
 
-    def wind_rose(dirs, speeds, weights, title, max_r):
+    def wind_rose(dirs, speeds, weights, title, max_r, note=None, ref_r=None):
         total_w = weights.sum()
         calm = speeds < CALM_THRESHOLD
         calm_pct = weights[calm].sum() / total_w * 100
@@ -480,6 +492,12 @@ def _(hv, np):
         # petals start outside a small blank center "hole" (standard wind-rose
         # convention) that displays the calm % without overlapping any wedge
         hole_r = max_r * 0.14
+        # A sector whose petals total f reaches radius hole_r + f, so the
+        # reference ring for a frequency of ref_r goes at hole_r + ref_r. When
+        # ref_r exceeds this rose's own peak the ring sits outside every petal,
+        # so the viewport has to grow to keep it visible -- which also reads
+        # correctly: the rose visibly falls short of the reference.
+        outer_r = max(max_r, ref_r) if ref_r else max_r
         polys = []
         for i in range(NSEC):
             c0, c1 = edges_deg[i], edges_deg[i + 1]
@@ -527,7 +545,7 @@ def _(hv, np):
             ["x", "y"],
             "text",
         ).opts(text_font_size="7pt", text_color="gray", text_align="left")
-        compass_r = (max_r + hole_r) * 1.1
+        compass_r = (outer_r + hole_r) * 1.1
         cxs = compass_r * np.cos(np.radians(90 - np.arange(0, 360, 45)))
         cys = compass_r * np.sin(np.radians(90 - np.arange(0, 360, 45)))
         compass = hv.Labels(
@@ -543,8 +561,21 @@ def _(hv, np):
             text_align="center",
             text_baseline="middle",
         )
-        lim = (max_r + hole_r) * 1.22
-        return (rings * wedges * hole * ring_labels * compass * center).opts(
+        lim = (outer_r + hole_r) * 1.22
+        rose = rings * wedges * hole * ring_labels * compass * center
+        if ref_r:
+            # Dashed and darker than the dotted gray gridlines so it reads as a
+            # reference value rather than another ring label.
+            rose = rose * hv.Ellipse(0, 0, 2 * (hole_r + ref_r)).opts(
+                color="#555555", line_width=1.25, line_dash="dashed"
+            )
+        if note:
+            # Caption under the rose rather than in the title: a rose on its own
+            # radial scale has to say so, and the title would truncate at 340px.
+            rose = rose * hv.Labels(
+                {"x": [0], "y": [-lim * 0.94], "text": [note]}, ["x", "y"], "text"
+            ).opts(text_font_size="7pt", text_color="dimgray", text_align="center")
+        return rose.opts(
             width=340,
             height=340,
             xaxis=None,
@@ -599,7 +630,7 @@ def _(hv, np):
 
 
 @app.cell
-def _(SEASON_ORDER, d, hv, np, pl, wind_rose, wind_rose_legend):
+def _(SEASON_ORDER, cruise, d, df, hv, np, pl, wind_rose, wind_rose_legend):
     _season_data = {}
     for _s in SEASON_ORDER:
         _sub = d.filter(
@@ -628,10 +659,51 @@ def _(SEASON_ORDER, d, hv, np, pl, wind_rose, wind_rose_legend):
         for _s in SEASON_ORDER
         if _s in _season_data
     ]
-    # 3 columns so the legend lands in the upper right: [winter, spring, legend] / [summer, fall]
+    # 3 columns so the legend lands in the upper right, which leaves the lower
+    # right slot free for the selected cruise:
+    #   [winter, spring, legend] / [summer, fall, cruise]
     _panels = _roses[:2] + [wind_rose_legend()] + _roses[2:]
+
+    # Fifth rose: the selected cruise. Taken from the season-unfiltered frame,
+    # same as sections 1 and 1b, so the season dropdown can't hide it.
+    #
+    # It gets its OWN radial scale rather than joining the shared seasonal one:
+    # a single cruise is a few days of one weather pattern, not a climatology,
+    # so its strongest sector runs ~20% of the time and can reach 50%, against
+    # 10-17% for a whole season. Folding it into the shared scale would shrink
+    # all four seasonal roses by up to 3x depending on which cruise is picked,
+    # making the season-to-season comparison depend on an unrelated control.
+    # The caption states the seasonal peak so the two can still be compared.
+    if cruise.value != "none":
+        _csub = df.filter(
+            (pl.col("cruise") == cruise.value)
+            & pl.col("wind_dir_deg").is_not_null()
+            & pl.col("wind_speed_m_s").is_not_null()
+        )
+        if len(_csub):
+            _cruise_data = (
+                _csub["wind_dir_deg"].to_numpy(),
+                _csub["wind_speed_m_s"].to_numpy(),
+                _csub["dt_s"].to_numpy(),
+            )
+            _cruise_max_r = _max_freq(*_cruise_data)
+            _note = (
+                f"own scale · dashed ring = seasonal peak ({_max_r:.1f}%)"
+                if _season_data
+                else "own scale"
+            )
+            _panels = _panels + [
+                wind_rose(
+                    *_cruise_data,
+                    cruise.value,
+                    _cruise_max_r,
+                    note=_note,
+                    ref_r=_max_r if _season_data else None,
+                )
+            ]
+
     hv.Layout(_panels).cols(3).opts(
-        title="Wind direction by season (time-weighted; 0°=N, clockwise)"
+        title="Wind direction by season, plus the selected cruise (time-weighted; 0°=N, clockwise)"
     )
     return
 
